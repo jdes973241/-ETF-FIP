@@ -38,7 +38,6 @@ def load_and_process_data():
     # 下載數據
     raw_data = yf.download(all_symbols, start=start_date, end=end_date, progress=False, auto_adjust=False)
     
-    # 處理多層索引或單一索引的欄位問題
     if 'Adj Close' in raw_data.columns:
         daily_adj_close = raw_data['Adj Close']
     elif 'Close' in raw_data.columns:
@@ -48,7 +47,6 @@ def load_and_process_data():
 
     daily_adj_close = daily_adj_close.astype(float)
     
-    # --- 🛡️ 數據源自我檢查機制 (Sanity Check) ---
     if daily_adj_close.empty:
         return None, None, None, None, None, None, "❌ 錯誤: 下載的數據為空。"
 
@@ -56,9 +54,8 @@ def load_and_process_data():
     today = datetime.now()
     days_diff = (today - last_dt).days
     
-    # 檢查 1: 數據是否過舊 (超過 5 天沒更新)
     if days_diff > 5:
-        return None, None, None, None, None, None, f"❌ 數據過舊警報！最新資料日期為 {last_dt.strftime('%Y-%m-%d')}，已超過 {days_diff} 天未更新。可能是 Yahoo Finance API 故障。"
+        return None, None, None, None, None, None, f"❌ 數據過舊警報！最新資料日期為 {last_dt.strftime('%Y-%m-%d')}，已超過 {days_diff} 天未更新。"
 
     monthly_prices = daily_adj_close.resample('ME').last()
 
@@ -69,8 +66,10 @@ def load_and_process_data():
     last_day_of_current_month = (next_month - timedelta(days=next_month.day)).date()
     
     cutoff_date = last_idx
-    msg = ""
+    # [修正] 預設訊息，防止狀態欄空白
+    msg = f"✅ 資料日期正常 (最新資料: {last_idx.strftime('%Y-%m-%d')})"
 
+    # 只有當「資料月份」等於「現在月份」時，才需要判斷是否因為月中而剔除
     if last_idx.month == current_date.month and last_idx.year == current_date.year:
         is_calendar_end = (current_date == last_day_of_current_month)
         is_friday_end = (
@@ -97,49 +96,31 @@ def load_and_process_data():
 # ==========================================
 data_pack = load_and_process_data()
 
-# 錯誤處理
 if data_pack[0] is None:
-    st.error(data_pack[6]) # 顯示錯誤訊息
+    st.error(data_pack[6])
     st.stop()
 
 monthly_ret, daily_ret, monthly_prices, assets_map, start_str, cutoff_date, status_msg = data_pack
 tickers = list(assets_map.keys())
 
-# --- 側邊欄：數據健康度檢查 ---
+# --- 側邊欄檢查 ---
 with st.sidebar:
     st.header("🛡️ 數據源健康度檢查")
-    st.write("請核對下方基準標的價格，若與您的券商軟體落差過大，請勿使用本策略。")
-    
-    # 定義一個安全的單一標的下載函數
     def get_safe_price(ticker):
         try:
-            # 改用 5d 避免假日空值，並加上 auto_adjust=False 確保有 Adj Close
             df = yf.download(ticker, period='5d', progress=False, auto_adjust=False)
             if df.empty: return 0.0
-            
-            # 優先找 Adj Close，沒有則找 Close
-            if 'Adj Close' in df.columns:
-                val = df['Adj Close']
-            elif 'Close' in df.columns:
-                val = df['Close']
-            else:
-                return 0.0
-                
-            # 處理多層索引問題
-            if isinstance(val, pd.DataFrame):
-                val = val.iloc[:, 0]
-                
+            if 'Adj Close' in df.columns: val = df['Adj Close']
+            elif 'Close' in df.columns: val = df['Close']
+            else: return 0.0
+            if isinstance(val, pd.DataFrame): val = val.iloc[:, 0]
             return val.iloc[-1].item()
-        except Exception:
-            return 0.0
+        except: return 0.0
     
-    # 檢查 VTI (美股基準)
     vti_price = get_safe_price('VTI')
     eem_price = get_safe_price('EEM')
-    
     st.metric("VTI (美股基準)", f"{vti_price:.2f}")
     st.metric("EEM (新興市場)", f"{eem_price:.2f}")
-    
     st.caption(f"即時數據驗證時間: {datetime.now().strftime('%H:%M')}")
     st.divider()
     st.info("資料源: Yahoo Finance")
@@ -178,35 +159,30 @@ for ticker in tickers:
         
         factor_stats.append({
             'Ticker': ticker, 
-            'Beta': beta,
+            '通過?': '✅' if is_pass else '', # [修改] 使用綠色勾勾 Emoji
             '1M Factor': factor_1m, 
             '12M Factor': factor_12m, 
-            'Result': is_pass
+            'Beta': beta
         })
     except:
         continue
 
 df_factor = pd.DataFrame(factor_stats)
 
-# 防止 df_factor 為空時報錯
 if not df_factor.empty:
-    # === 修正部分：手動轉為百分比數值 ===
-    df_factor['1M Factor'] = df_factor['1M Factor'] * 100
-    df_factor['12M Factor'] = df_factor['12M Factor'] * 100
+    # [修改] 使用 Pandas Styler 實作正負值顏色顯示
+    def color_pos_neg(val):
+        color = '#28a745' if val > 0 else '#dc3545' # Green / Red
+        return f'color: {color}'
 
-    st.dataframe(
-        df_factor,
-        column_order=("Ticker", "Result", "1M Factor", "12M Factor", "Beta"),
-        hide_index=True,
-        use_container_width=True,
-        column_config={
-            "Result": st.column_config.CheckboxColumn("通過?", disabled=True),
-            # === 修正部分：使用 %.2f%% 格式 ===
-            "1M Factor": st.column_config.NumberColumn(format="%.2f%%", help="去除 Beta 後的 1 個月報酬"),
-            "12M Factor": st.column_config.NumberColumn(format="%.2f%%", help="去除 Beta 後的 12 個月報酬"),
-            "Beta": st.column_config.ProgressColumn("Beta", format="%.2f", min_value=0, max_value=2),
-        }
-    )
+    # 設定顯示格式
+    styler = df_factor.style.format({
+        '1M Factor': '{:.2%}',
+        '12M Factor': '{:.2%}',
+        'Beta': '{:.2f}'
+    }).map(color_pos_neg, subset=['1M Factor', '12M Factor']) # 只對這兩欄上色
+
+    st.dataframe(styler, use_container_width=True, hide_index=True)
 
 if not survivors:
     st.error("❌ 沒有標的通過第一階段，建議持有現金 (SGOV/BIL)。")
@@ -219,24 +195,40 @@ else:
     
     lookbacks = [3, 6, 9, 12]
     z_scores_raw = pd.DataFrame(index=tickers)
+    
+    # 用來存顯示用的原始數據
+    display_raw_metrics = pd.DataFrame(index=tickers)
+    
     all_prices = monthly_prices[tickers]
 
-    # Z-Score 計算
+    # Z-Score 與 原始數值 計算
     for lb in lookbacks:
         p_now = all_prices.iloc[-1]
         p_prev = all_prices.iloc[-1 - lb]
         period_rets = (p_now / p_prev) - 1
+        
+        # 存原始數值 (Raw)
+        display_raw_metrics[f'{lb}M(%)'] = period_rets
+        
+        # 存 Z-Score
         z_vals = zscore(period_rets, ddof=1, nan_policy='omit')
         z_scores_raw[f'Z_{lb}M'] = pd.Series(z_vals, index=tickers)
 
     # Daily FIP
     last_252d_daily_ret = daily_ret[tickers].tail(252)
     fip_daily_score = (last_252d_daily_ret > 0).sum() / last_252d_daily_ret.count()
+    
+    # 存 FIP 原始數值
+    display_raw_metrics['FIP(%)'] = fip_daily_score
+    
+    # 存 FIP Z-Score
     z_fip_daily = zscore(fip_daily_score, ddof=1, nan_policy='omit')
     z_scores_raw['Z_FIP'] = pd.Series(z_fip_daily, index=tickers)
 
     # 總分計算
     final_df = z_scores_raw.loc[survivors].copy()
+    raw_df = display_raw_metrics.loc[survivors].copy()
+    
     final_df['Mom_Score'] = final_df[[f'Z_{lb}M' for lb in lookbacks]].sum(axis=1)
     final_df['FIP_Score'] = final_df['Z_FIP']
     final_df['Total_Score'] = final_df['Mom_Score'] + final_df['FIP_Score']
@@ -246,45 +238,50 @@ else:
     if not final_df.empty:
         winner = final_df.index[0]
 
-        # A. 視覺化
+        # A. 視覺化 (堆疊圖)
         st.subheader("📊 得分結構拆解")
         chart_data = final_df[['Mom_Score', 'FIP_Score']]
         chart_data.columns = ['相對動能 (Mom)', '品質 (FIP)']
         st.bar_chart(chart_data, height=300)
 
-        # B. 詳解表
-        st.subheader("🧮 計算詳解 (Z-Score)")
-        display_df = final_df[['Total_Score', 'Mom_Score', 'FIP_Score', 'Z_3M', 'Z_6M', 'Z_9M', 'Z_12M', 'Z_FIP']].copy()
+        # B. 詳解表 (合併 總分 + 原始數據)
+        st.subheader("🧮 詳細數據表 (含原始報酬與 FIP)")
+        st.caption("此表顯示計算出的總分，以及各回顧期的「原始報酬率」供參考。")
+        
+        # 準備要顯示的 DataFrame
+        # 欄位順序：總分 -> FIP(原始) -> 3M(原始) -> 6M -> 9M -> 12M
+        cols_to_show = ['Total_Score', 'FIP(%)', '3M(%)', '6M(%)', '9M(%)', '12M(%)']
+        
+        # 將 Raw Data 併入 Final DF
+        merged_display = pd.concat([final_df[['Total_Score']], raw_df], axis=1)
+        merged_display = merged_display.loc[final_df.index] # 確保順序跟排名一樣
+        
+        # [修改] 顯示設定：保留原始數值，總分用 Bar
         st.dataframe(
-            display_df,
+            merged_display[cols_to_show],
             use_container_width=True,
             column_config={
                 "Total_Score": st.column_config.ProgressColumn("總分", format="%.2f", min_value=-10, max_value=10),
-                "Mom_Score": st.column_config.NumberColumn("動能總分", format="%.2f"),
-                "FIP_Score": st.column_config.NumberColumn("FIP總分", format="%.2f"),
-                "Z_3M": st.column_config.NumberColumn("3M (Z)", format="%.2f"),
-                "Z_6M": st.column_config.NumberColumn("6M (Z)", format="%.2f"),
-                "Z_9M": st.column_config.NumberColumn("9M (Z)", format="%.2f"),
-                "Z_12M": st.column_config.NumberColumn("12M (Z)", format="%.2f"),
-                "Z_FIP": st.column_config.NumberColumn("FIP (Z)", format="%.2f"),
+                "FIP(%)": st.column_config.NumberColumn("FIP (正報酬天數)", format="%.1%"),
+                "3M(%)": st.column_config.NumberColumn("3M 報酬", format="%.1%"),
+                "6M(%)": st.column_config.NumberColumn("6M 報酬", format="%.1%"),
+                "9M(%)": st.column_config.NumberColumn("9M 報酬", format="%.1%"),
+                "12M(%)": st.column_config.NumberColumn("12M 報酬", format="%.1%"),
             }
         )
 
-        # C. 最終贏家 + 外部驗證
+        # C. 最終贏家
         st.divider()
         st.header(f"🏆 最終贏家: :red[{winner}]")
         
         col_w1, col_w2, col_w3 = st.columns(3)
         col_w1.metric("總分", f"{final_df.loc[winner, 'Total_Score']:.2f}")
-        col_w2.metric("動能", f"{final_df.loc[winner, 'Mom_Score']:.2f}")
-        col_w3.metric("FIP", f"{final_df.loc[winner, 'FIP_Score']:.2f}")
+        col_w2.metric("動能得分", f"{final_df.loc[winner, 'Mom_Score']:.2f}")
+        col_w3.metric("FIP 得分", f"{final_df.loc[winner, 'FIP_Score']:.2f}")
         
-        # 外部連結按鈕
         st.markdown("### 🔍 執行前最後確認")
-        st.markdown("請點擊下方連結，確認即時價格走勢與 App 計算結果是否一致：")
-        
         col_link1, col_link2 = st.columns(2)
         with col_link1:
-            st.link_button(f"前往 TradingView 查看 {winner}", f"https://www.tradingview.com/chart/?symbol={winner}")
+            st.link_button(f"前往 TradingView ({winner})", f"https://www.tradingview.com/chart/?symbol={winner}")
         with col_link2:
-            st.link_button(f"前往 Yahoo Finance 查看 {winner}", f"https://finance.yahoo.com/quote/{winner}")
+            st.link_button(f"前往 Yahoo Finance ({winner})", f"https://finance.yahoo.com/quote/{winner}")

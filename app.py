@@ -66,7 +66,6 @@ def load_and_process_data():
     last_day_of_current_month = (next_month - timedelta(days=next_month.day)).date()
     
     cutoff_date = last_idx
-    # 預設訊息，防止狀態欄空白
     msg = f"✅ 資料日期正常 (最新資料: {last_idx.strftime('%Y-%m-%d')})"
 
     if last_idx.month == current_date.month and last_idx.year == current_date.year:
@@ -158,7 +157,7 @@ for ticker in tickers:
         
         factor_stats.append({
             'Ticker': ticker, 
-            '通過?': '✅' if is_pass else '', 
+            '通過?': '✅' if is_pass else '',
             '1M Factor': factor_1m, 
             '12M Factor': factor_12m, 
             'Beta': beta
@@ -169,7 +168,6 @@ for ticker in tickers:
 df_factor = pd.DataFrame(factor_stats)
 
 if not df_factor.empty:
-    # 手動轉為百分比數值
     df_factor['1M Factor'] = df_factor['1M Factor'] * 100
     df_factor['12M Factor'] = df_factor['12M Factor'] * 100
 
@@ -196,9 +194,7 @@ else:
     
     lookbacks = [3, 6, 9, 12]
     z_scores_raw = pd.DataFrame(index=tickers)
-    
     display_raw_metrics = pd.DataFrame(index=tickers)
-    
     all_prices = monthly_prices[tickers]
 
     # Z-Score 計算
@@ -222,6 +218,7 @@ else:
     z_scores_raw['Z_FIP'] = pd.Series(z_fip_daily, index=tickers)
 
     # 總分計算
+    # 只取倖存者
     final_df = z_scores_raw.loc[survivors].copy()
     raw_df = display_raw_metrics.loc[survivors].copy()
     
@@ -240,30 +237,53 @@ else:
         chart_data.columns = ['相對動能 (Mom)', '品質 (FIP)']
         st.bar_chart(chart_data, height=300)
 
-        # B. 詳解表
-        st.subheader("🧮 詳細數據表 (含原始報酬與 FIP)")
-        st.caption("此表顯示計算出的總分，以及各回顧期的「原始報酬率」供參考。")
+        # B. 雙表顯示：原始 vs 標準化
+        st.subheader("🧮 數據詳情")
         
-        cols_to_show = ['Total_Score', 'FIP(%)', '3M(%)', '6M(%)', '9M(%)', '12M(%)']
-        merged_display = pd.concat([final_df[['Total_Score']], raw_df], axis=1)
-        merged_display = merged_display.loc[final_df.index]
+        # 建立兩個分頁
+        tab1, tab2 = st.tabs(["🔢 原始數據 (報酬率/佔比)", "📊 標準化數據 (Z-Score)"])
         
-        # [核心修正] 將原始數據乘以 100，以便在前端顯示為百分比
-        merged_display[['FIP(%)', '3M(%)', '6M(%)', '9M(%)', '12M(%)']] *= 100
-        
-        st.dataframe(
-            merged_display[cols_to_show],
-            use_container_width=True,
-            column_config={
-                "Total_Score": st.column_config.ProgressColumn("總分", format="%.2f", min_value=-10, max_value=10),
-                # [核心修正] 修正格式語法為 %.2f%%
-                "FIP(%)": st.column_config.NumberColumn("FIP (正報酬天數)", format="%.2f%%"),
-                "3M(%)": st.column_config.NumberColumn("3M 報酬", format="%.2f%%"),
-                "6M(%)": st.column_config.NumberColumn("6M 報酬", format="%.2f%%"),
-                "9M(%)": st.column_config.NumberColumn("9M 報酬", format="%.2f%%"),
-                "12M(%)": st.column_config.NumberColumn("12M 報酬", format="%.2f%%"),
-            }
-        )
+        with tab1:
+            st.caption("此表顯示各週期的「原始報酬率」與「正報酬天數佔比」。")
+            # 準備原始數據表：總分 + Raw Data
+            raw_display_cols = ['Total_Score', 'FIP(%)', '3M(%)', '6M(%)', '9M(%)', '12M(%)']
+            merged_raw = pd.concat([final_df[['Total_Score']], raw_df], axis=1)
+            merged_raw = merged_raw.loc[final_df.index]
+            
+            # 手動轉百分比數值
+            merged_raw[['FIP(%)', '3M(%)', '6M(%)', '9M(%)', '12M(%)']] *= 100
+            
+            st.dataframe(
+                merged_raw[raw_display_cols],
+                use_container_width=True,
+                column_config={
+                    "Total_Score": st.column_config.ProgressColumn("總分", format="%.2f", min_value=-10, max_value=10),
+                    "FIP(%)": st.column_config.NumberColumn("FIP (正報酬天數)", format="%.2f%%"),
+                    "3M(%)": st.column_config.NumberColumn("3M 報酬", format="%.2f%%"),
+                    "6M(%)": st.column_config.NumberColumn("6M 報酬", format="%.2f%%"),
+                    "9M(%)": st.column_config.NumberColumn("9M 報酬", format="%.2f%%"),
+                    "12M(%)": st.column_config.NumberColumn("12M 報酬", format="%.2f%%"),
+                }
+            )
+
+        with tab2:
+            st.caption("此表顯示標準化後的 Z 分數。Z > 0 代表優於平均，數值越大越好。")
+            # 準備標準化表：總分結構 + Z-Scores
+            z_display_cols = ['Total_Score', 'Mom_Score', 'FIP_Score', 'Z_3M', 'Z_6M', 'Z_9M', 'Z_12M', 'Z_FIP']
+            st.dataframe(
+                final_df[z_display_cols],
+                use_container_width=True,
+                column_config={
+                    "Total_Score": st.column_config.ProgressColumn("總分", format="%.2f", min_value=-10, max_value=10),
+                    "Mom_Score": st.column_config.NumberColumn("動能總分", format="%.2f"),
+                    "FIP_Score": st.column_config.NumberColumn("FIP總分", format="%.2f"),
+                    "Z_3M": st.column_config.NumberColumn("3M (Z)", format="%.2f"),
+                    "Z_6M": st.column_config.NumberColumn("6M (Z)", format="%.2f"),
+                    "Z_9M": st.column_config.NumberColumn("9M (Z)", format="%.2f"),
+                    "Z_12M": st.column_config.NumberColumn("12M (Z)", format="%.2f"),
+                    "Z_FIP": st.column_config.NumberColumn("FIP (Z)", format="%.2f"),
+                }
+            )
 
         # C. 最終贏家
         st.divider()

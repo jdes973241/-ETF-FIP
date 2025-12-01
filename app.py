@@ -6,13 +6,13 @@ from scipy.stats import zscore
 from datetime import datetime, timedelta
 
 # ==========================================
-# 頁面設定 (手機優化)
+# 頁面設定
 # ==========================================
 st.set_page_config(page_title="因子動能策略監控", layout="wide")
 st.title("📊 因子動能與 FIP 策略儀表板")
 
 # ==========================================
-# 核心邏輯函數
+# 核心邏輯
 # ==========================================
 def calculate_daily_beta(asset, bench, daily_df, lookback=252):
     subset = daily_df[[asset, bench]].dropna().tail(lookback)
@@ -20,7 +20,7 @@ def calculate_daily_beta(asset, bench, daily_df, lookback=252):
     cov = np.cov(subset[asset], subset[bench])
     return cov[0, 1] / cov[1, 1]
 
-@st.cache_data(ttl=3600) # 設定快取 1 小時，避免重複下載
+@st.cache_data(ttl=3600)
 def load_and_process_data():
     assets_map = {
         'IMOM': 'EFA', 'IVAL': 'EFA', 'IDHQ': 'EFA', 'GWX': 'EFA',
@@ -31,11 +31,11 @@ def load_and_process_data():
     benchmarks = list(set(assets_map.values()))
     all_symbols = tickers + benchmarks
 
-    # 設定資料長度
+    # 下載較長區間以確保計算無誤
     start_date = (datetime.now() - timedelta(days=365*3 + 30)).strftime('%Y-%m-%d')
     end_date = (datetime.now() + timedelta(days=1)).strftime('%Y-%m-%d')
     
-    # 下載
+    # 下載數據
     raw_data = yf.download(all_symbols, start=start_date, end=end_date, progress=False, auto_adjust=False)
     
     if 'Adj Close' in raw_data.columns:
@@ -43,10 +43,19 @@ def load_and_process_data():
     elif 'Close' in raw_data.columns:
         daily_adj_close = raw_data['Close']
     else:
-        st.error("無法下載價格資料")
-        return None, None, None, None
+        return None, None, None, None, None, None, "❌ 嚴重錯誤: 無法下載價格資料"
 
     daily_adj_close = daily_adj_close.astype(float)
+    
+    # --- 🛡️ 數據源自我檢查機制 (Sanity Check) ---
+    last_dt = daily_adj_close.index[-1]
+    today = datetime.now()
+    days_diff = (today - last_dt).days
+    
+    # 檢查 1: 數據是否過舊 (超過 5 天沒更新)
+    if days_diff > 5:
+        return None, None, None, None, None, None, f"❌ 數據過舊警報！最新資料日期為 {last_dt.strftime('%Y-%m-%d')}，已超過 {days_diff} 天未更新。可能是 Yahoo Finance API 故障。"
+
     monthly_prices = daily_adj_close.resample('ME').last()
 
     # --- 智能日期切割 ---
@@ -83,110 +92,166 @@ def load_and_process_data():
 # 執行計算與顯示
 # ==========================================
 data_pack = load_and_process_data()
-if data_pack[0] is not None:
-    monthly_ret, daily_ret, monthly_prices, assets_map, start_str, cutoff_date, status_msg = data_pack
-    tickers = list(assets_map.keys())
 
-    # 1. 資訊顯示
-    st.info(f"**狀態更新**: {status_msg}")
-    col1, col2 = st.columns(2)
-    with col1:
-        st.metric("資料起始日", start_str)
-    with col2:
-        st.metric("分析基準日 (Cutoff)", cutoff_date.strftime('%Y-%m-%d'))
-    st.caption(f"最後更新時間: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+# 錯誤處理
+if data_pack[0] is None:
+    st.error(data_pack[6]) # 顯示錯誤訊息
+    st.stop()
 
-    # 2. 因子動能篩選
-    factor_stats = []
-    survivors = []
-    current_idx = monthly_ret.index[-1]
+monthly_ret, daily_ret, monthly_prices, assets_map, start_str, cutoff_date, status_msg = data_pack
+tickers = list(assets_map.keys())
 
-    for ticker in tickers:
-        bench = assets_map[ticker]
-        try:
-            beta = calculate_daily_beta(ticker, bench, daily_ret)
-            
-            # 1M Pure
-            r_asset_1m = monthly_ret.loc[current_idx, ticker]
-            r_bench_1m = monthly_ret.loc[current_idx, bench]
-            factor_1m = r_asset_1m - (beta * r_bench_1m)
-            
-            # 12M Pure
-            p_now = monthly_prices.loc[current_idx, ticker]
-            p_12m = monthly_prices.iloc[-13][ticker]
-            r_asset_12m = (p_now / p_12m) - 1
-            p_b_now = monthly_prices.loc[current_idx, bench]
-            p_b_12m = monthly_prices.iloc[-13][bench]
-            r_bench_12m = (p_b_now / p_b_12m) - 1
-            factor_12m = r_asset_12m - (beta * r_bench_12m)
-            
-            is_pass = (factor_1m > 0) and (factor_12m > 0)
-            if is_pass: survivors.append(ticker)
-            
-            factor_stats.append({
-                '標的': ticker, 
-                '基準': bench,
-                'Beta': round(beta, 2),
-                '1M 因子報酬': f"{factor_1m:.2%}", 
-                '12M 因子報酬': f"{factor_12m:.2%}", 
-                '結果': '✅ 通過' if is_pass else '❌ 淘汰'
-            })
-        except:
-            continue
+# --- 側邊欄：數據健康度檢查 ---
+with st.sidebar:
+    st.header("🛡️ 數據源健康度檢查")
+    st.write("請核對下方基準標的價格，若與您的券商軟體落差過大，請勿使用本策略。")
+    
+    # 取得最新一筆交易日的數據
+    latest_day_data = daily_ret.iloc[-1]
+    latest_price_data = monthly_prices.iloc[-1] # 這裡近似取用最後價格，實際上用 daily_adj_close 顯示價格更準
+    
+    # 為了顯示精準價格，我們重新從 daily_adj_close 取最後一筆
+    # 注意：這裡要從原始數據取，因為 monthly_prices 可能被切回上個月
+    # 但為了邏輯一致，我們顯示的是「計算當下」使用的最新價格
+    
+    # 檢查 VTI (美股基準)
+    vti_price = yf.download('VTI', period='1d', progress=False)['Adj Close'].iloc[-1].item()
+    eem_price = yf.download('EEM', period='1d', progress=False)['Adj Close'].iloc[-1].item()
+    
+    st.metric("VTI (美股基準)", f"{vti_price:.2f}")
+    st.metric("EEM (新興市場)", f"{eem_price:.2f}")
+    
+    st.caption(f"即時數據驗證時間: {datetime.now().strftime('%H:%M')}")
+    st.divider()
+    st.info("資料源: Yahoo Finance")
 
-    st.subheader("1. 因子動能篩選 (去除 Beta 後)")
-    df_factor = pd.DataFrame(factor_stats).set_index('標的')
-    st.dataframe(df_factor, use_container_width=True)
+# --- 主畫面 ---
+st.info(f"**系統狀態**: {status_msg}")
+col_k1, col_k2 = st.columns(2)
+col_k1.metric("分析基準日", cutoff_date.strftime('%Y-%m-%d'))
+col_k2.caption(f"策略更新時間: {datetime.now().strftime('%Y-%m-%d %H:%M')}")
 
-    if not survivors:
-        st.error("沒有標的通過第一階段篩選，建議持有現金 (SGOV/BIL)。")
-    else:
-        st.success(f"晉級第二階段標的 ({len(survivors)}): {', '.join(survivors)}")
+# --- 第一階段：因子動能 ---
+st.header("1️⃣ 第一階段：因子動能篩選")
+factor_stats = []
+survivors = []
+current_idx = monthly_ret.index[-1]
 
-        # 3. 相對動能 + FIP 計算
-        lookbacks = [3, 6, 9, 12]
-        z_scores_all = pd.DataFrame(index=tickers)
-        display_metrics = pd.DataFrame(index=survivors)
-        all_prices = monthly_prices[tickers]
-
-        # 相對動能 Z-Score
-        for lb in lookbacks:
-            p_now = all_prices.iloc[-1]
-            p_prev = all_prices.iloc[-1 - lb]
-            period_rets = (p_now / p_prev) - 1
-            z_vals = zscore(period_rets, ddof=1, nan_policy='omit')
-            z_scores_all[f'Z_{lb}M'] = pd.Series(z_vals, index=tickers)
-            display_metrics[f'{lb}M 報酬'] = period_rets[survivors]
-
-        # Daily FIP
-        last_252d_daily_ret = daily_ret[tickers].tail(252)
-        fip_daily_score = (last_252d_daily_ret > 0).sum() / last_252d_daily_ret.count()
-        z_fip_daily = zscore(fip_daily_score, ddof=1, nan_policy='omit')
-        z_scores_all['Z_FIP'] = pd.Series(z_fip_daily, index=tickers)
-        display_metrics['FIP (日正報酬%)'] = fip_daily_score[survivors]
-
-        # 總分計算
-        final_z_scores = z_scores_all.loc[survivors].copy()
-        final_z_scores['總分 (Total Z)'] = final_z_scores.sum(axis=1)
-
-        # 整理最終表格
-        final_df = pd.concat([display_metrics, final_z_scores[['總分 (Total Z)']]], axis=1)
-        # 格式化顯示百分比
-        for col in final_df.columns:
-            if '報酬' in col or 'FIP' in col:
-                final_df[col] = final_df[col].apply(lambda x: f"{x:.2%}")
+for ticker in tickers:
+    bench = assets_map[ticker]
+    try:
+        beta = calculate_daily_beta(ticker, bench, daily_ret)
         
-        final_df = final_df.sort_values(by='總分 (Total Z)', ascending=False)
-
-        st.subheader("2. 最終排名 (相對動能 + FIP)")
-        st.dataframe(final_df, use_container_width=True)
-
-        # 4. 最終贏家
-        winner = final_df.index[0]
-        winner_score = final_df.loc[winner, '總分 (Total Z)']
-        winner_fip = final_df.loc[winner, 'FIP (日正報酬%)']
+        r_asset_1m = monthly_ret.loc[current_idx, ticker]
+        r_bench_1m = monthly_ret.loc[current_idx, bench]
+        factor_1m = r_asset_1m - (beta * r_bench_1m)
         
-        st.divider()
-        st.header(f"🏆 本月最終贏家: :red[{winner}]")
-        st.metric(label="總分", value=f"{winner_score:.4f}")
-        st.write(f"該標的在過去一年中，有 **{winner_fip}** 的交易日是上漲的，顯示出極佳的動能品質。")
+        p_now = monthly_prices.loc[current_idx, ticker]
+        p_12m = monthly_prices.iloc[-13][ticker]
+        r_asset_12m = (p_now / p_12m) - 1
+        p_b_now = monthly_prices.loc[current_idx, bench]
+        p_b_12m = monthly_prices.iloc[-13][bench]
+        r_bench_12m = (p_b_now / p_b_12m) - 1
+        factor_12m = r_asset_12m - (beta * r_bench_12m)
+        
+        is_pass = (factor_1m > 0) and (factor_12m > 0)
+        if is_pass: survivors.append(ticker)
+        
+        factor_stats.append({
+            'Ticker': ticker, 
+            'Beta': beta,
+            '1M Factor': factor_1m, 
+            '12M Factor': factor_12m, 
+            'Result': is_pass
+        })
+    except:
+        continue
+
+df_factor = pd.DataFrame(factor_stats)
+
+st.dataframe(
+    df_factor,
+    column_order=("Ticker", "Result", "1M Factor", "12M Factor", "Beta"),
+    hide_index=True,
+    use_container_width=True,
+    column_config={
+        "Result": st.column_config.CheckboxColumn("通過?", disabled=True),
+        "1M Factor": st.column_config.NumberColumn(format="%.2%", help="去除 Beta 後的 1 個月報酬"),
+        "12M Factor": st.column_config.NumberColumn(format="%.2%", help="去除 Beta 後的 12 個月報酬"),
+        "Beta": st.column_config.ProgressColumn("Beta", format="%.2f", min_value=0, max_value=2),
+    }
+)
+
+if not survivors:
+    st.error("❌ 沒有標的通過第一階段，建議持有現金 (SGOV/BIL)。")
+else:
+    st.success(f"✅ 晉級標的: {', '.join(survivors)}")
+
+    # --- 第二階段：相對動能 + FIP ---
+    st.divider()
+    st.header("2️⃣ 第二階段：相對動能 + FIP 總分")
+    
+    lookbacks = [3, 6, 9, 12]
+    z_scores_raw = pd.DataFrame(index=tickers)
+    all_prices = monthly_prices[tickers]
+
+    # Z-Score 計算
+    for lb in lookbacks:
+        p_now = all_prices.iloc[-1]
+        p_prev = all_prices.iloc[-1 - lb]
+        period_rets = (p_now / p_prev) - 1
+        z_vals = zscore(period_rets, ddof=1, nan_policy='omit')
+        z_scores_raw[f'Z_{lb}M'] = pd.Series(z_vals, index=tickers)
+
+    # Daily FIP
+    last_252d_daily_ret = daily_ret[tickers].tail(252)
+    fip_daily_score = (last_252d_daily_ret > 0).sum() / last_252d_daily_ret.count()
+    z_fip_daily = zscore(fip_daily_score, ddof=1, nan_policy='omit')
+    z_scores_raw['Z_FIP'] = pd.Series(z_fip_daily, index=tickers)
+
+    # 總分計算
+    final_df = z_scores_raw.loc[survivors].copy()
+    final_df['Mom_Score'] = final_df[[f'Z_{lb}M' for lb in lookbacks]].sum(axis=1)
+    final_df['FIP_Score'] = final_df['Z_FIP']
+    final_df['Total_Score'] = final_df['Mom_Score'] + final_df['FIP_Score']
+    
+    final_df = final_df.sort_values(by='Total_Score', ascending=False)
+    winner = final_df.index[0]
+
+    # A. 視覺化
+    st.subheader("📊 得分結構拆解")
+    chart_data = final_df[['Mom_Score', 'FIP_Score']]
+    chart_data.columns = ['相對動能 (Mom)', '品質 (FIP)']
+    st.bar_chart(chart_data, height=300)
+
+    # B. 詳解表
+    st.subheader("🧮 計算詳解 (Z-Score)")
+    display_df = final_df[['Total_Score', 'Mom_Score', 'FIP_Score', 'Z_3M', 'Z_6M', 'Z_9M', 'Z_12M', 'Z_FIP']].copy()
+    st.dataframe(
+        display_df,
+        use_container_width=True,
+        column_config={
+            "Total_Score": st.column_config.ProgressColumn("總分", format="%.2f", min_value=-10, max_value=10),
+            "Mom_Score": st.column_config.NumberColumn("動能總分", format="%.2f"),
+            "FIP_Score": st.column_config.NumberColumn("FIP總分", format="%.2f"),
+        }
+    )
+
+    # C. 最終贏家 + 外部驗證
+    st.divider()
+    st.header(f"🏆 最終贏家: :red[{winner}]")
+    
+    col_w1, col_w2, col_w3 = st.columns(3)
+    col_w1.metric("總分", f"{final_df.loc[winner, 'Total_Score']:.2f}")
+    col_w2.metric("動能", f"{final_df.loc[winner, 'Mom_Score']:.2f}")
+    col_w3.metric("FIP", f"{final_df.loc[winner, 'FIP_Score']:.2f}")
+    
+    # 外部連結按鈕
+    st.markdown("### 🔍 執行前最後確認")
+    st.markdown("請點擊下方連結，確認即時價格走勢與 App 計算結果是否一致：")
+    
+    col_link1, col_link2 = st.columns(2)
+    with col_link1:
+        st.link_button(f"前往 TradingView 查看 {winner}", f"https://www.tradingview.com/chart/?symbol={winner}")
+    with col_link2:
+        st.link_button(f"前往 Yahoo Finance 查看 {winner}", f"https://finance.yahoo.com/quote/{winner}")

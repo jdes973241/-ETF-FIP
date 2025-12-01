@@ -66,10 +66,9 @@ def load_and_process_data():
     last_day_of_current_month = (next_month - timedelta(days=next_month.day)).date()
     
     cutoff_date = last_idx
-    # [修正] 預設訊息，防止狀態欄空白
+    # 預設訊息，防止狀態欄空白
     msg = f"✅ 資料日期正常 (最新資料: {last_idx.strftime('%Y-%m-%d')})"
 
-    # 只有當「資料月份」等於「現在月份」時，才需要判斷是否因為月中而剔除
     if last_idx.month == current_date.month and last_idx.year == current_date.year:
         is_calendar_end = (current_date == last_day_of_current_month)
         is_friday_end = (
@@ -159,7 +158,7 @@ for ticker in tickers:
         
         factor_stats.append({
             'Ticker': ticker, 
-            '通過?': '✅' if is_pass else '', # [修改] 使用綠色勾勾 Emoji
+            '通過?': '✅' if is_pass else '', 
             '1M Factor': factor_1m, 
             '12M Factor': factor_12m, 
             'Beta': beta
@@ -170,17 +169,19 @@ for ticker in tickers:
 df_factor = pd.DataFrame(factor_stats)
 
 if not df_factor.empty:
-    # [修改] 使用 Pandas Styler 實作正負值顏色顯示
+    # 手動轉為百分比數值
+    df_factor['1M Factor'] = df_factor['1M Factor'] * 100
+    df_factor['12M Factor'] = df_factor['12M Factor'] * 100
+
     def color_pos_neg(val):
-        color = '#28a745' if val > 0 else '#dc3545' # Green / Red
+        color = '#28a745' if val > 0 else '#dc3545'
         return f'color: {color}'
 
-    # 設定顯示格式
     styler = df_factor.style.format({
-        '1M Factor': '{:.2%}',
-        '12M Factor': '{:.2%}',
+        '1M Factor': '{:.2f}%',
+        '12M Factor': '{:.2f}%',
         'Beta': '{:.2f}'
-    }).map(color_pos_neg, subset=['1M Factor', '12M Factor']) # 只對這兩欄上色
+    }).map(color_pos_neg, subset=['1M Factor', '12M Factor'])
 
     st.dataframe(styler, use_container_width=True, hide_index=True)
 
@@ -196,21 +197,18 @@ else:
     lookbacks = [3, 6, 9, 12]
     z_scores_raw = pd.DataFrame(index=tickers)
     
-    # 用來存顯示用的原始數據
     display_raw_metrics = pd.DataFrame(index=tickers)
     
     all_prices = monthly_prices[tickers]
 
-    # Z-Score 與 原始數值 計算
+    # Z-Score 計算
     for lb in lookbacks:
         p_now = all_prices.iloc[-1]
         p_prev = all_prices.iloc[-1 - lb]
         period_rets = (p_now / p_prev) - 1
         
-        # 存原始數值 (Raw)
         display_raw_metrics[f'{lb}M(%)'] = period_rets
         
-        # 存 Z-Score
         z_vals = zscore(period_rets, ddof=1, nan_policy='omit')
         z_scores_raw[f'Z_{lb}M'] = pd.Series(z_vals, index=tickers)
 
@@ -218,10 +216,8 @@ else:
     last_252d_daily_ret = daily_ret[tickers].tail(252)
     fip_daily_score = (last_252d_daily_ret > 0).sum() / last_252d_daily_ret.count()
     
-    # 存 FIP 原始數值
     display_raw_metrics['FIP(%)'] = fip_daily_score
     
-    # 存 FIP Z-Score
     z_fip_daily = zscore(fip_daily_score, ddof=1, nan_policy='omit')
     z_scores_raw['Z_FIP'] = pd.Series(z_fip_daily, index=tickers)
 
@@ -238,35 +234,34 @@ else:
     if not final_df.empty:
         winner = final_df.index[0]
 
-        # A. 視覺化 (堆疊圖)
+        # A. 視覺化
         st.subheader("📊 得分結構拆解")
         chart_data = final_df[['Mom_Score', 'FIP_Score']]
         chart_data.columns = ['相對動能 (Mom)', '品質 (FIP)']
         st.bar_chart(chart_data, height=300)
 
-        # B. 詳解表 (合併 總分 + 原始數據)
+        # B. 詳解表
         st.subheader("🧮 詳細數據表 (含原始報酬與 FIP)")
         st.caption("此表顯示計算出的總分，以及各回顧期的「原始報酬率」供參考。")
         
-        # 準備要顯示的 DataFrame
-        # 欄位順序：總分 -> FIP(原始) -> 3M(原始) -> 6M -> 9M -> 12M
         cols_to_show = ['Total_Score', 'FIP(%)', '3M(%)', '6M(%)', '9M(%)', '12M(%)']
-        
-        # 將 Raw Data 併入 Final DF
         merged_display = pd.concat([final_df[['Total_Score']], raw_df], axis=1)
-        merged_display = merged_display.loc[final_df.index] # 確保順序跟排名一樣
+        merged_display = merged_display.loc[final_df.index]
         
-        # [修改] 顯示設定：保留原始數值，總分用 Bar
+        # [核心修正] 將原始數據乘以 100，以便在前端顯示為百分比
+        merged_display[['FIP(%)', '3M(%)', '6M(%)', '9M(%)', '12M(%)']] *= 100
+        
         st.dataframe(
             merged_display[cols_to_show],
             use_container_width=True,
             column_config={
                 "Total_Score": st.column_config.ProgressColumn("總分", format="%.2f", min_value=-10, max_value=10),
-                "FIP(%)": st.column_config.NumberColumn("FIP (正報酬天數)", format="%.1%"),
-                "3M(%)": st.column_config.NumberColumn("3M 報酬", format="%.1%"),
-                "6M(%)": st.column_config.NumberColumn("6M 報酬", format="%.1%"),
-                "9M(%)": st.column_config.NumberColumn("9M 報酬", format="%.1%"),
-                "12M(%)": st.column_config.NumberColumn("12M 報酬", format="%.1%"),
+                # [核心修正] 修正格式語法為 %.2f%%
+                "FIP(%)": st.column_config.NumberColumn("FIP (正報酬天數)", format="%.2f%%"),
+                "3M(%)": st.column_config.NumberColumn("3M 報酬", format="%.2f%%"),
+                "6M(%)": st.column_config.NumberColumn("6M 報酬", format="%.2f%%"),
+                "9M(%)": st.column_config.NumberColumn("9M 報酬", format="%.2f%%"),
+                "12M(%)": st.column_config.NumberColumn("12M 報酬", format="%.2f%%"),
             }
         )
 

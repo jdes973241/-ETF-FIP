@@ -38,6 +38,7 @@ def load_and_process_data():
     # 下載數據
     raw_data = yf.download(all_symbols, start=start_date, end=end_date, progress=False, auto_adjust=False)
     
+    # 處理多層索引或單一索引的欄位問題
     if 'Adj Close' in raw_data.columns:
         daily_adj_close = raw_data['Adj Close']
     elif 'Close' in raw_data.columns:
@@ -48,6 +49,9 @@ def load_and_process_data():
     daily_adj_close = daily_adj_close.astype(float)
     
     # --- 🛡️ 數據源自我檢查機制 (Sanity Check) ---
+    if daily_adj_close.empty:
+        return None, None, None, None, None, None, "❌ 錯誤: 下載的數據為空。"
+
     last_dt = daily_adj_close.index[-1]
     today = datetime.now()
     days_diff = (today - last_dt).days
@@ -106,17 +110,32 @@ with st.sidebar:
     st.header("🛡️ 數據源健康度檢查")
     st.write("請核對下方基準標的價格，若與您的券商軟體落差過大，請勿使用本策略。")
     
-    # 取得最新一筆交易日的數據
-    latest_day_data = daily_ret.iloc[-1]
-    latest_price_data = monthly_prices.iloc[-1] # 這裡近似取用最後價格，實際上用 daily_adj_close 顯示價格更準
-    
-    # 為了顯示精準價格，我們重新從 daily_adj_close 取最後一筆
-    # 注意：這裡要從原始數據取，因為 monthly_prices 可能被切回上個月
-    # 但為了邏輯一致，我們顯示的是「計算當下」使用的最新價格
+    # 定義一個安全的單一標的下載函數
+    def get_safe_price(ticker):
+        try:
+            # 改用 5d 避免假日空值，並加上 auto_adjust=False 確保有 Adj Close
+            df = yf.download(ticker, period='5d', progress=False, auto_adjust=False)
+            if df.empty: return 0.0
+            
+            # 優先找 Adj Close，沒有則找 Close
+            if 'Adj Close' in df.columns:
+                val = df['Adj Close']
+            elif 'Close' in df.columns:
+                val = df['Close']
+            else:
+                return 0.0
+                
+            # 處理多層索引問題 (yfinance 新版特性)
+            if isinstance(val, pd.DataFrame):
+                val = val.iloc[:, 0] # 取第一欄
+                
+            return val.iloc[-1].item()
+        except Exception:
+            return 0.0
     
     # 檢查 VTI (美股基準)
-    vti_price = yf.download('VTI', period='1d', progress=False)['Adj Close'].iloc[-1].item()
-    eem_price = yf.download('EEM', period='1d', progress=False)['Adj Close'].iloc[-1].item()
+    vti_price = get_safe_price('VTI')
+    eem_price = get_safe_price('EEM')
     
     st.metric("VTI (美股基準)", f"{vti_price:.2f}")
     st.metric("EEM (新興市場)", f"{eem_price:.2f}")
@@ -169,18 +188,20 @@ for ticker in tickers:
 
 df_factor = pd.DataFrame(factor_stats)
 
-st.dataframe(
-    df_factor,
-    column_order=("Ticker", "Result", "1M Factor", "12M Factor", "Beta"),
-    hide_index=True,
-    use_container_width=True,
-    column_config={
-        "Result": st.column_config.CheckboxColumn("通過?", disabled=True),
-        "1M Factor": st.column_config.NumberColumn(format="%.2%", help="去除 Beta 後的 1 個月報酬"),
-        "12M Factor": st.column_config.NumberColumn(format="%.2%", help="去除 Beta 後的 12 個月報酬"),
-        "Beta": st.column_config.ProgressColumn("Beta", format="%.2f", min_value=0, max_value=2),
-    }
-)
+# 防止 df_factor 為空時報錯
+if not df_factor.empty:
+    st.dataframe(
+        df_factor,
+        column_order=("Ticker", "Result", "1M Factor", "12M Factor", "Beta"),
+        hide_index=True,
+        use_container_width=True,
+        column_config={
+            "Result": st.column_config.CheckboxColumn("通過?", disabled=True),
+            "1M Factor": st.column_config.NumberColumn(format="%.2%", help="去除 Beta 後的 1 個月報酬"),
+            "12M Factor": st.column_config.NumberColumn(format="%.2%", help="去除 Beta 後的 12 個月報酬"),
+            "Beta": st.column_config.ProgressColumn("Beta", format="%.2f", min_value=0, max_value=2),
+        }
+    )
 
 if not survivors:
     st.error("❌ 沒有標的通過第一階段，建議持有現金 (SGOV/BIL)。")
@@ -216,42 +237,44 @@ else:
     final_df['Total_Score'] = final_df['Mom_Score'] + final_df['FIP_Score']
     
     final_df = final_df.sort_values(by='Total_Score', ascending=False)
-    winner = final_df.index[0]
-
-    # A. 視覺化
-    st.subheader("📊 得分結構拆解")
-    chart_data = final_df[['Mom_Score', 'FIP_Score']]
-    chart_data.columns = ['相對動能 (Mom)', '品質 (FIP)']
-    st.bar_chart(chart_data, height=300)
-
-    # B. 詳解表
-    st.subheader("🧮 計算詳解 (Z-Score)")
-    display_df = final_df[['Total_Score', 'Mom_Score', 'FIP_Score', 'Z_3M', 'Z_6M', 'Z_9M', 'Z_12M', 'Z_FIP']].copy()
-    st.dataframe(
-        display_df,
-        use_container_width=True,
-        column_config={
-            "Total_Score": st.column_config.ProgressColumn("總分", format="%.2f", min_value=-10, max_value=10),
-            "Mom_Score": st.column_config.NumberColumn("動能總分", format="%.2f"),
-            "FIP_Score": st.column_config.NumberColumn("FIP總分", format="%.2f"),
-        }
-    )
-
-    # C. 最終贏家 + 外部驗證
-    st.divider()
-    st.header(f"🏆 最終贏家: :red[{winner}]")
     
-    col_w1, col_w2, col_w3 = st.columns(3)
-    col_w1.metric("總分", f"{final_df.loc[winner, 'Total_Score']:.2f}")
-    col_w2.metric("動能", f"{final_df.loc[winner, 'Mom_Score']:.2f}")
-    col_w3.metric("FIP", f"{final_df.loc[winner, 'FIP_Score']:.2f}")
-    
-    # 外部連結按鈕
-    st.markdown("### 🔍 執行前最後確認")
-    st.markdown("請點擊下方連結，確認即時價格走勢與 App 計算結果是否一致：")
-    
-    col_link1, col_link2 = st.columns(2)
-    with col_link1:
-        st.link_button(f"前往 TradingView 查看 {winner}", f"https://www.tradingview.com/chart/?symbol={winner}")
-    with col_link2:
-        st.link_button(f"前往 Yahoo Finance 查看 {winner}", f"https://finance.yahoo.com/quote/{winner}")
+    if not final_df.empty:
+        winner = final_df.index[0]
+
+        # A. 視覺化
+        st.subheader("📊 得分結構拆解")
+        chart_data = final_df[['Mom_Score', 'FIP_Score']]
+        chart_data.columns = ['相對動能 (Mom)', '品質 (FIP)']
+        st.bar_chart(chart_data, height=300)
+
+        # B. 詳解表
+        st.subheader("🧮 計算詳解 (Z-Score)")
+        display_df = final_df[['Total_Score', 'Mom_Score', 'FIP_Score', 'Z_3M', 'Z_6M', 'Z_9M', 'Z_12M', 'Z_FIP']].copy()
+        st.dataframe(
+            display_df,
+            use_container_width=True,
+            column_config={
+                "Total_Score": st.column_config.ProgressColumn("總分", format="%.2f", min_value=-10, max_value=10),
+                "Mom_Score": st.column_config.NumberColumn("動能總分", format="%.2f"),
+                "FIP_Score": st.column_config.NumberColumn("FIP總分", format="%.2f"),
+            }
+        )
+
+        # C. 最終贏家 + 外部驗證
+        st.divider()
+        st.header(f"🏆 最終贏家: :red[{winner}]")
+        
+        col_w1, col_w2, col_w3 = st.columns(3)
+        col_w1.metric("總分", f"{final_df.loc[winner, 'Total_Score']:.2f}")
+        col_w2.metric("動能", f"{final_df.loc[winner, 'Mom_Score']:.2f}")
+        col_w3.metric("FIP", f"{final_df.loc[winner, 'FIP_Score']:.2f}")
+        
+        # 外部連結按鈕
+        st.markdown("### 🔍 執行前最後確認")
+        st.markdown("請點擊下方連結，確認即時價格走勢與 App 計算結果是否一致：")
+        
+        col_link1, col_link2 = st.columns(2)
+        with col_link1:
+            st.link_button(f"前往 TradingView 查看 {winner}", f"https://www.tradingview.com/chart/?symbol={winner}")
+        with col_link2:
+            st.link_button(f"前往 Yahoo Finance 查看 {winner}", f"https://finance.yahoo.com/quote/{winner}")

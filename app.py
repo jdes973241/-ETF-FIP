@@ -188,20 +188,26 @@ for ticker in tickers:
 
 df_factor = pd.DataFrame(factor_stats)
 
-# 防止 df_factor 為空時報錯
-if not df_factor.empty:
-    st.dataframe(
-        df_factor,
-        column_order=("Ticker", "Result", "1M Factor", "12M Factor", "Beta"),
-        hide_index=True,
-        use_container_width=True,
-        column_config={
-            "Result": st.column_config.CheckboxColumn("通過?", disabled=True),
-            "1M Factor": st.column_config.NumberColumn(format="%.2%", help="去除 Beta 後的 1 個月報酬"),
-            "12M Factor": st.column_config.NumberColumn(format="%.2%", help="去除 Beta 後的 12 個月報酬"),
-            "Beta": st.column_config.ProgressColumn("Beta", format="%.2f", min_value=0, max_value=2),
-        }
-    )
+    # 防止 df_factor 為空時報錯
+    if not df_factor.empty:
+        # === [修正 1] 手動將小數點數值轉為百分比數值 (例如 0.03 -> 3.0) ===
+        df_factor['1M Factor'] = df_factor['1M Factor'] * 100
+        df_factor['12M Factor'] = df_factor['12M Factor'] * 100
+
+        st.dataframe(
+            df_factor,
+            column_order=("Ticker", "Result", "1M Factor", "12M Factor", "Beta"),
+            hide_index=True,
+            use_container_width=True,
+            column_config={
+                "Result": st.column_config.CheckboxColumn("通過?", disabled=True),
+                # === [修正 2] 修正格式語法 ===
+                # "%.2f" 代表保留兩位小數，"%%" 代表顯示一個百分比符號
+                "1M Factor": st.column_config.NumberColumn(format="%.2f%%", help="去除 Beta 後的 1 個月報酬"),
+                "12M Factor": st.column_config.NumberColumn(format="%.2f%%", help="去除 Beta 後的 12 個月報酬"),
+                "Beta": st.column_config.ProgressColumn("Beta", format="%.2f", min_value=0, max_value=2),
+            }
+        )
 
 if not survivors:
     st.error("❌ 沒有標的通過第一階段，建議持有現金 (SGOV/BIL)。")

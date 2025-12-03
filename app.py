@@ -39,17 +39,24 @@ def calculate_fip(daily_series, lookback=252):
 def load_and_process_data():
     # 1. 定義資產池
     assets_map = {
+        # 國際已開發
         'IMOM': 'EFA', 'IVAL': 'EFA', 'IDHQ': 'EFA', 'GWX': 'EFA',
+        # 美國
         'QMOM': 'VTI', 'QVAL': 'VTI', 'SPHQ': 'VTI', 'SCHA': 'VTI',
+        # 新興市場
         'PIE': 'EEM',  'DFEV': 'EEM', 'DEHP': 'EEM', 'EEMS': 'EEM'
     }
     
     equity_tickers = list(assets_map.keys())
     benchmarks = list(set(assets_map.values()))
+    
+    # 避險池 (Hedge Assets)
     safe_pool = ['TLT', 'GLD']
+    
     all_symbols = list(set(equity_tickers + benchmarks + safe_pool))
 
     # 2. 下載數據
+    # 抓取 3 年數據以確保有足夠的移動平均和 Beta 計算緩衝
     start_date = (datetime.now() - timedelta(days=365*3)).strftime('%Y-%m-%d')
     end_date = (datetime.now() + timedelta(days=1)).strftime('%Y-%m-%d')
     
@@ -63,22 +70,25 @@ def load_and_process_data():
     else:
         return None, None, None, None, None, None, "❌ 嚴重錯誤: 無法下載價格資料"
 
-    prices = prices.astype(float).ffill()
+    prices = prices.astype(float).ffill() # 填補空值
     
     if prices.empty:
         return None, None, None, None, None, None, "❌ 錯誤: 下載的數據為空。"
 
+    # 檢查數據新鮮度
     last_dt = prices.index[-1]
     today = datetime.now()
     if (today - last_dt).days > 7:
         st.warning(f"⚠️ 注意：最新數據日期為 {last_dt.strftime('%Y-%m-%d')}，可能非即時數據。")
 
-    # 3. 智能月結算
+    # 3. 智能月結算日期處理
     monthly_prices = prices.resample('ME').last()
+    
     current_date = datetime.now().date()
     last_idx = monthly_prices.index[-1]
-    next_day = current_date + timedelta(days=1)
     
+    # 檢查本月是否已結束
+    next_day = current_date + timedelta(days=1)
     if last_idx.month == current_date.month and last_idx.year == current_date.year:
          if next_day.month == current_date.month: 
              msg = f"⚠️ 本月 ({last_idx.strftime('%Y-%m')}) 尚未結束，使用上個月底數據進行分析。"
@@ -107,11 +117,12 @@ if data_pack[0] is None:
 monthly_ret, daily_ret, monthly_prices, assets_map, safe_pool, cutoff_date, status_msg = data_pack
 equity_tickers = list(assets_map.keys())
 
-# --- 側邊欄 ---
+# --- 側邊欄：市場快照 ---
 with st.sidebar:
     st.header("📈 市場快照")
     st.info(f"分析基準日: {cutoff_date.strftime('%Y-%m-%d')}")
     st.caption(status_msg)
+    
     try:
         vti_p = monthly_prices.loc[cutoff_date, 'VTI']
         tlt_p = monthly_prices.loc[cutoff_date, 'TLT']
@@ -121,7 +132,7 @@ with st.sidebar:
     st.divider()
 
 # ==========================================
-# 第一階段：市場狀態判斷
+# 第一階段：市場狀態判斷 (Regime Filter)
 # ==========================================
 st.subheader("1️⃣ 第一階段：市場狀態判斷 (Regime Filter)")
 
@@ -135,20 +146,25 @@ for ticker in equity_tickers:
         p_now = monthly_prices.loc[cutoff_date, ticker]
         ticker_avg_mom = 0
         p_vals = []
+        
         for p in periods:
             p_prev = monthly_prices.iloc[-1-p][ticker] 
             r = (p_now / p_prev) - 1
             ticker_avg_mom += r
             p_vals.append(r)
+            
         ticker_avg_mom /= 4
         regime_stats.append({
-            'Ticker': ticker, 'Avg_Mom': ticker_avg_mom,
+            'Ticker': ticker,
+            'Avg_Mom': ticker_avg_mom,
             '3M': p_vals[0], '6M': p_vals[1], '9M': p_vals[2], '12M': p_vals[3]
         })
+        
         if not np.isnan(ticker_avg_mom):
             mom_sum += ticker_avg_mom
             valid_count += 1
-    except: continue
+    except Exception as e:
+        continue
 
 universe_mom = mom_sum / valid_count if valid_count > 0 else 0
 is_bull_market = universe_mom > 0
@@ -169,7 +185,9 @@ st.divider()
 # ==========================================
 
 if not is_bull_market:
-    # 🐻 避險模式
+    # ==========================
+    # 🐻 避險模式 (Risk-Off)
+    # ==========================
     st.header("2️⃣ 第二階段 (A)：避險模式 (Risk-Off)")
     st.info("全市場動能 < 0，啟動避險。比較 TLT 與 GLD 的 12 個月報酬率。")
     
@@ -182,11 +200,14 @@ if not is_bull_market:
             p_now = monthly_prices.loc[cutoff_date, asset]
             p_12m = monthly_prices.iloc[-13][asset]
             r_12m = (p_now / p_12m) - 1
+            
             hedge_stats.append({'Asset': asset, '12M Return': r_12m})
+            
             if r_12m > best_hedge_ret:
                 best_hedge_ret = r_12m
                 best_hedge = asset
-        except: st.warning(f"缺少 {asset} 數據")
+        except:
+            st.warning(f"缺少 {asset} 數據")
 
     df_hedge = pd.DataFrame(hedge_stats)
     df_hedge['Selected'] = df_hedge['Asset'].apply(lambda x: '✅' if x == best_hedge else '')
@@ -194,10 +215,12 @@ if not is_bull_market:
     st.success(f"🛡️ 本月建議持倉: **{best_hedge}** (100% 權重)")
 
 else:
-    # 🐂 進攻模式
+    # ==========================
+    # 🐂 進攻模式 (Risk-On)
+    # ==========================
     st.header("2️⃣ 第二階段 (B)：進攻模式 (Risk-On)")
     
-    # --- Alpha Filter ---
+    # --- 2.1 初階濾網 (Alpha Filter) ---
     st.subheader("篩選：Alpha 濾網")
     st.caption("條件：(1M Alpha > 0) OR (12M Alpha > 0)")
     
@@ -207,28 +230,42 @@ else:
     for ticker in equity_tickers:
         bench = assets_map[ticker]
         try:
+            # 計算 Beta (最近 252 日)
             beta = calculate_daily_beta(ticker, bench, daily_ret, lookback=252)
+            
+            # 1M 數據
             r_asset_1m = monthly_ret.loc[cutoff_date, ticker]
             r_bench_1m = monthly_ret.loc[cutoff_date, bench]
             alpha_1m = r_asset_1m - (beta * r_bench_1m)
             
+            # 12M 數據
             p_now = monthly_prices.loc[cutoff_date, ticker]
             p_12m = monthly_prices.iloc[-13][ticker]
             r_asset_12m = (p_now / p_12m) - 1
+            
             p_b_now = monthly_prices.loc[cutoff_date, bench]
             p_b_12m = monthly_prices.iloc[-13][bench]
             r_bench_12m = (p_b_now / p_b_12m) - 1
+            
             alpha_12m = r_asset_12m - (beta * r_bench_12m)
             
             is_pass = (alpha_1m > 0) or (alpha_12m > 0)
-            if is_pass: survivors.append(ticker)
+            
+            if is_pass:
+                survivors.append(ticker)
+                
             filter_data.append({
-                'Ticker': ticker, 'Pass': '✅' if is_pass else '',
-                '1M Alpha': alpha_1m, '12M Alpha': alpha_12m, 'Beta': beta
+                'Ticker': ticker,
+                'Pass': '✅' if is_pass else '',
+                '1M Alpha': alpha_1m,
+                '12M Alpha': alpha_12m,
+                'Beta': beta
             })
-        except: continue
+        except Exception as e:
+            continue
             
     df_filter = pd.DataFrame(filter_data)
+    # 高亮顯示正負值
     st.dataframe(df_filter.style.format({
         '1M Alpha': '{:.2%}', '12M Alpha': '{:.2%}', 'Beta': '{:.2f}'
     }).map(lambda x: 'color: green' if x > 0 else 'color: red', subset=['1M Alpha', '12M Alpha']))
@@ -237,24 +274,30 @@ else:
         st.error("⚠️ 沒有標的通過 Alpha 濾網。建議轉為持有備用資產 (VT) 或現金。")
         st.stop()
         
-    # --- Scoring & Ranking ---
+    # --- 2.2 總分排名 (Scoring & Ranking) ---
     st.subheader("排名：綜合動能 (75%) + 品質 (25%)")
     
-    # 準備原始數據
+    # 準備計算 Z-Score 的數據集 (只針對 Survivors)
     metrics_df = pd.DataFrame(index=survivors)
+    
     for ticker in survivors:
         try:
             p_now = monthly_prices.loc[cutoff_date, ticker]
+            # 計算 3, 6, 9, 12M 報酬
             for p in periods:
                 p_prev = monthly_prices.iloc[-1-p][ticker]
                 r = (p_now / p_prev) - 1
                 metrics_df.loc[ticker, f'R_{p}M'] = r
+            
+            # 計算 FIP
             fip = calculate_fip(daily_ret[ticker])
             metrics_df.loc[ticker, 'FIP'] = fip
         except: continue
         
-    # 計算標準化數據
+    # 計算 Z-Score (橫截面)
     z_df = pd.DataFrame(index=survivors)
+    
+    # 動能 Z
     mom_z_cols = []
     for p in periods:
         col_name = f'Z_{p}M'
@@ -271,18 +314,21 @@ else:
     
     # 排序
     z_df = z_df.sort_values(by='Total_Score', ascending=False)
+    
+    # 選出 Top 3
     top_3 = z_df.head(3).index.tolist()
     
-    # 整合數據用於顯示
-    metrics_df['Total_Score'] = z_df['Total_Score'] # 將總分合併回原始數據表方便排序
-    metrics_df = metrics_df.loc[z_df.index] # 確保順序一致
+    # 合併原始數據以便顯示
+    metrics_df['Total_Score'] = z_df['Total_Score']
+    metrics_df = metrics_df.loc[z_df.index]
 
-    # --- 關鍵修改：使用 Tabs 切換視圖 ---
+    # 使用 Tabs 切換視圖
     tab_z, tab_raw = st.tabs(["📊 標準化數據 (Z-Score & 貢獻)", "🔢 原始數據 (報酬率 & FIP)"])
 
     with tab_z:
         st.caption("此表顯示經過標準化 (Z-Score) 後的分數，用於最終排名。")
         z_display_cols = ['Total_Score', 'Mom_Contrib (75%)', 'FIP_Contrib (25%)', 'Avg_Mom_Z', 'Z_FIP']
+        
         st.dataframe(
             z_df[z_display_cols],
             use_container_width=True,
@@ -298,20 +344,22 @@ else:
     with tab_raw:
         st.caption("此表顯示未經處理的原始報酬率與 FIP 百分比。")
         raw_display_cols = ['Total_Score', 'FIP'] + [f'R_{p}M' for p in periods]
+        
         st.dataframe(
             metrics_df[raw_display_cols],
             use_container_width=True,
             column_config={
                 "Total_Score": st.column_config.NumberColumn("總分", format="%.2f"),
-                "FIP": st.column_config.NumberColumn("FIP (正報酬天數)", format="%.2%", help="數值越高代表股價上漲越平滑"),
-                "R_3M": st.column_config.NumberColumn("3M 報酬", format="%.2%"),
-                "R_6M": st.column_config.NumberColumn("6M 報酬", format="%.2%"),
-                "R_9M": st.column_config.NumberColumn("9M 報酬", format="%.2%"),
-                "R_12M": st.column_config.NumberColumn("12M 報酬", format="%.2%"),
+                # 這裡修正了格式字串為 %.2f%%
+                "FIP": st.column_config.NumberColumn("FIP (正報酬天數)", format="%.2f%%", help="數值越高代表股價上漲越平滑"),
+                "R_3M": st.column_config.NumberColumn("3M 報酬", format="%.2f%%"),
+                "R_6M": st.column_config.NumberColumn("6M 報酬", format="%.2f%%"),
+                "R_9M": st.column_config.NumberColumn("9M 報酬", format="%.2f%%"),
+                "R_12M": st.column_config.NumberColumn("12M 報酬", format="%.2f%%"),
             }
         )
     
-    # --- Allocation ---
+    # --- 2.3 資金配置 (Allocation) ---
     st.subheader("🏆 最終資金配置 (Top 3 等權重)")
     
     cols = st.columns(len(top_3))
@@ -319,11 +367,13 @@ else:
         with cols[i]:
             st.success(f"**{ticker}**")
             st.markdown("#### 33.3%")
+            # 嘗試獲取中文名稱或全名
             try:
                 name = yf.Ticker(ticker).info.get('longName', '')
                 st.caption(name)
             except: pass
 
+    # 連結按鈕
     st.divider()
     st.write("🔗 快速連結:")
     c_links = st.columns(len(top_3))

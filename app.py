@@ -265,7 +265,6 @@ else:
             continue
             
     df_filter = pd.DataFrame(filter_data)
-    # 高亮顯示正負值
     st.dataframe(df_filter.style.format({
         '1M Alpha': '{:.2%}', '12M Alpha': '{:.2%}', 'Beta': '{:.2f}'
     }).map(lambda x: 'color: green' if x > 0 else 'color: red', subset=['1M Alpha', '12M Alpha']))
@@ -277,27 +276,22 @@ else:
     # --- 2.2 總分排名 (Scoring & Ranking) ---
     st.subheader("排名：綜合動能 (75%) + 品質 (25%)")
     
-    # 準備計算 Z-Score 的數據集 (只針對 Survivors)
+    # 準備計算 Z-Score 的數據集
     metrics_df = pd.DataFrame(index=survivors)
-    
     for ticker in survivors:
         try:
             p_now = monthly_prices.loc[cutoff_date, ticker]
-            # 計算 3, 6, 9, 12M 報酬
             for p in periods:
                 p_prev = monthly_prices.iloc[-1-p][ticker]
                 r = (p_now / p_prev) - 1
                 metrics_df.loc[ticker, f'R_{p}M'] = r
             
-            # 計算 FIP
             fip = calculate_fip(daily_ret[ticker])
             metrics_df.loc[ticker, 'FIP'] = fip
         except: continue
         
-    # 計算 Z-Score (橫截面)
+    # 計算 Z-Score
     z_df = pd.DataFrame(index=survivors)
-    
-    # 動能 Z
     mom_z_cols = []
     for p in periods:
         col_name = f'Z_{p}M'
@@ -314,15 +308,13 @@ else:
     
     # 排序
     z_df = z_df.sort_values(by='Total_Score', ascending=False)
-    
-    # 選出 Top 3
     top_3 = z_df.head(3).index.tolist()
     
-    # 合併原始數據以便顯示
+    # 將總分合併回原始數據以便顯示
     metrics_df['Total_Score'] = z_df['Total_Score']
     metrics_df = metrics_df.loc[z_df.index]
 
-    # 使用 Tabs 切換視圖
+    # --- 使用 Tabs 切換視圖 ---
     tab_z, tab_raw = st.tabs(["📊 標準化數據 (Z-Score & 貢獻)", "🔢 原始數據 (報酬率 & FIP)"])
 
     with tab_z:
@@ -343,15 +335,20 @@ else:
 
     with tab_raw:
         st.caption("此表顯示未經處理的原始報酬率與 FIP 百分比。")
+        
+        # 關鍵修正：建立一個副本並乘以 100 以顯示正確百分比
+        display_raw_df = metrics_df.copy()
+        pct_cols = ['FIP'] + [f'R_{p}M' for p in periods]
+        display_raw_df[pct_cols] = display_raw_df[pct_cols] * 100
+        
         raw_display_cols = ['Total_Score', 'FIP'] + [f'R_{p}M' for p in periods]
         
         st.dataframe(
-            metrics_df[raw_display_cols],
+            display_raw_df[raw_display_cols],
             use_container_width=True,
             column_config={
                 "Total_Score": st.column_config.NumberColumn("總分", format="%.2f"),
-                # 這裡修正了格式字串為 %.2f%%
-                "FIP": st.column_config.NumberColumn("FIP (正報酬天數)", format="%.2f%%", help="數值越高代表股價上漲越平滑"),
+                "FIP": st.column_config.NumberColumn("FIP (正報酬天數)", format="%.2f%%"),
                 "R_3M": st.column_config.NumberColumn("3M 報酬", format="%.2f%%"),
                 "R_6M": st.column_config.NumberColumn("6M 報酬", format="%.2f%%"),
                 "R_9M": st.column_config.NumberColumn("9M 報酬", format="%.2f%%"),
@@ -367,13 +364,11 @@ else:
         with cols[i]:
             st.success(f"**{ticker}**")
             st.markdown("#### 33.3%")
-            # 嘗試獲取中文名稱或全名
             try:
                 name = yf.Ticker(ticker).info.get('longName', '')
                 st.caption(name)
             except: pass
 
-    # 連結按鈕
     st.divider()
     st.write("🔗 快速連結:")
     c_links = st.columns(len(top_3))

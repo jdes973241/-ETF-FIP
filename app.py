@@ -136,7 +136,7 @@ with st.sidebar:
     st.divider()
 
 # ==========================================
-# 第一階段：市場狀態判斷 (Regime Filter)
+# 第一階段：市場狀態判斷 (Count-Based Regime)
 # ==========================================
 st.subheader("1️⃣ 第一階段：市場狀態判斷 (Regime Filter)")
 
@@ -159,6 +159,7 @@ for ticker in equity_tickers:
             
         ticker_avg_mom /= 4
         
+        # 判斷正負
         status_icon = "🟢" if ticker_avg_mom > 0 else "🔴"
         if ticker_avg_mom < 0:
             neg_count += 1
@@ -175,6 +176,7 @@ for ticker in equity_tickers:
     except Exception as e:
         continue
 
+# 判斷邏輯：若負動能數量 >= 6，則為熊市
 THRESHOLD_N = 6
 is_bull_market = neg_count < THRESHOLD_N
 
@@ -197,8 +199,9 @@ st.divider()
 # ==========================================
 
 if not is_bull_market:
+    # 🐻 避險模式
     st.header("2️⃣ 第二階段 (A)：避險模式 (Risk-Off)")
-    st.info(f"轉弱標的達 {neg_count} 檔 (>= {THRESHOLD_N})，啟動避險。比較 TLT 與 GLD 的 12 個月報酬率。")
+    st.info("全市場動能 < 0，啟動避險。比較 TLT 與 GLD 的 12 個月報酬率。")
     
     hedge_stats = []
     best_hedge = None
@@ -224,7 +227,10 @@ if not is_bull_market:
     st.success(f"🛡️ 本月建議持倉: **{best_hedge}** (100% 權重)")
 
 else:
+    # 🐂 進攻模式
     st.header("2️⃣ 第二階段 (B)：進攻模式 (Risk-On)")
+    
+    # --- Alpha Filter ---
     st.subheader("篩選：Alpha 濾網")
     st.caption("條件：(1M Alpha > 0) OR (12M Alpha > 0)")
     
@@ -253,7 +259,7 @@ else:
                 'Ticker': ticker, 'Pass': '✅' if is_pass else '',
                 '1M Alpha': alpha_1m, '12M Alpha': alpha_12m, 'Beta': beta
             })
-        except: continue
+        except Exception as e: continue
             
     df_filter = pd.DataFrame(filter_data)
     st.dataframe(df_filter.style.format({
@@ -264,6 +270,7 @@ else:
         st.error("⚠️ 沒有標的通過 Alpha 濾網。建議轉為持有備用資產 (VT) 或現金。")
         st.stop()
         
+    # --- Scoring & Ranking ---
     st.subheader("排名：綜合動能 (75%) + 品質 (25%)")
     
     metrics_df = pd.DataFrame(index=survivors)
@@ -313,6 +320,7 @@ else:
         raw_display_cols = ['Total_Score', 'FIP'] + [f'R_{p}M' for p in periods]
         st.dataframe(display_raw_df[raw_display_cols], use_container_width=True, column_config={"Total_Score": st.column_config.NumberColumn("總分", format="%.2f")})
     
+    # --- 2.3 資金配置 (Allocation) ---
     st.subheader("🏆 最終資金配置 (Top 3 等權重)")
     cols = st.columns(len(top_3))
     for i, ticker in enumerate(top_3):
@@ -456,31 +464,51 @@ if st.button("🚀 開始執行回測 (Run Backtest)"):
     res_df['Equity'] = (1 + res_df['Strategy']).cumprod()
     res_df['DD'] = res_df['Equity'] / res_df['Equity'].cummax() - 1
     
+    # Benchmark Stats
     bench_ret = monthly_ret['VT'].loc[res_df.index]
     bench_equity = (1 + bench_ret).cumprod()
     bench_dd = bench_equity / bench_equity.cummax() - 1
     
-    total_ret = res_df['Equity'].iloc[-1] - 1
     years = len(res_df) / 12
+    # Strategy Metrics
     cagr = (res_df['Equity'].iloc[-1]) ** (1/years) - 1
     mdd = res_df['DD'].min()
-    
     neg_rets = res_df.loc[res_df['Strategy'] < 0, 'Strategy']
     down_std = neg_rets.std() * np.sqrt(12) if len(neg_rets) > 0 else 1e-6
     sortino = (res_df['Strategy'].mean() * 12) / down_std
     sharpe = (res_df['Strategy'].mean() * 12) / (res_df['Strategy'].std() * np.sqrt(12))
-    
     roll5y = res_df['Equity'].rolling(60).apply(lambda x: (x.iloc[-1]/x.iloc[0])**(1/5) - 1).mean()
     
-    # 指標顯示
-    col_m1, col_m2, col_m3, col_m4, col_m5 = st.columns(5)
-    col_m1.metric("CAGR (年化)", f"{cagr:.2%}")
-    col_m2.metric("MDD (最大回撤)", f"{mdd:.2%}")
-    col_m3.metric("Sharpe Ratio", f"{sharpe:.2f}")
-    col_m4.metric("Sortino Ratio", f"{sortino:.2f}")
-    col_m5.metric("Avg Rolling 5Y", f"{roll5y:.2%}")
+    # Benchmark Metrics
+    b_cagr = (bench_equity.iloc[-1]) ** (1/years) - 1
+    b_mdd = bench_dd.min()
+    b_neg = bench_ret[bench_ret < 0]
+    b_down_std = b_neg.std() * np.sqrt(12) if len(b_neg) > 0 else 1e-6
+    b_sortino = (bench_ret.mean() * 12) / b_down_std
+    b_sharpe = (bench_ret.mean() * 12) / (bench_ret.std() * np.sqrt(12))
+    b_roll5y = bench_equity.rolling(60).apply(lambda x: (x.iloc[-1]/x.iloc[0])**(1/5) - 1).mean()
     
-    # 繪圖 (使用 Altair)
+    # Helper Display Function
+    def display_metric_pair(label, val_strat, val_bench, fmt="{:.2%}"):
+        st.markdown(f"""
+        <div style="margin-bottom: 10px;">
+            <p style="font-size: 14px; margin-bottom: 0px; color: #888;">{label}</p>
+            <span style="font-size: 24px; font-weight: bold;">{fmt.format(val_strat)}</span>
+            <span style="font-size: 14px; color: gray; margin-left: 8px;">(VT: {fmt.format(val_bench)})</span>
+        </div>
+        """, unsafe_allow_html=True)
+
+    # 顯示數據
+    c1, c2, c3, c4, c5 = st.columns(5)
+    with c1: display_metric_pair("CAGR", cagr, b_cagr)
+    with c2: display_metric_pair("MDD", mdd, b_mdd)
+    with c3: display_metric_pair("Sharpe", sharpe, b_sharpe, "{:.2f}")
+    with c4: display_metric_pair("Sortino", sortino, b_sortino, "{:.2f}")
+    with c5: display_metric_pair("Avg Rolling 5Y", roll5y, b_roll5y)
+    
+    st.divider()
+
+    # --- Altair Charts ---
     
     # A. 權益曲線
     df_chart = pd.DataFrame({
@@ -492,7 +520,7 @@ if st.button("🚀 開始執行回測 (Run Backtest)"):
     chart_equity = alt.Chart(df_chart).mark_line().encode(
         x='Date',
         y=alt.Y('Return', axis=alt.Axis(format='%')),
-        color=alt.Color('Asset', scale=alt.Scale(domain=['Strategy', 'Benchmark (VT)'], range=['#FFD700', '#00B4D8'])), # Gold vs Light Blue
+        color=alt.Color('Asset', scale=alt.Scale(domain=['Strategy', 'Benchmark (VT)'], range=['#FFD700', '#00B4D8'])), 
         tooltip=['Date', 'Asset', alt.Tooltip('Return', format='.2%')]
     ).properties(title='累積報酬率 (Cumulative Return)')
     

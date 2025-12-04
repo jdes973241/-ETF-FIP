@@ -2,6 +2,7 @@ import streamlit as st
 import yfinance as yf
 import pandas as pd
 import numpy as np
+import altair as alt
 from scipy.stats import zscore
 from datetime import datetime, timedelta
 
@@ -135,7 +136,7 @@ with st.sidebar:
     st.divider()
 
 # ==========================================
-# 第一階段：市場狀態判斷 (Count-Based Regime)
+# 第一階段：市場狀態判斷 (Regime Filter)
 # ==========================================
 st.subheader("1️⃣ 第一階段：市場狀態判斷 (Regime Filter)")
 
@@ -158,7 +159,6 @@ for ticker in equity_tickers:
             
         ticker_avg_mom /= 4
         
-        # 判斷正負
         status_icon = "🟢" if ticker_avg_mom > 0 else "🔴"
         if ticker_avg_mom < 0:
             neg_count += 1
@@ -175,7 +175,6 @@ for ticker in equity_tickers:
     except Exception as e:
         continue
 
-# 判斷邏輯：若負動能數量 >= 6，則為熊市
 THRESHOLD_N = 6
 is_bull_market = neg_count < THRESHOLD_N
 
@@ -198,7 +197,6 @@ st.divider()
 # ==========================================
 
 if not is_bull_market:
-    # 🐻 避險模式
     st.header("2️⃣ 第二階段 (A)：避險模式 (Risk-Off)")
     st.info(f"轉弱標的達 {neg_count} 檔 (>= {THRESHOLD_N})，啟動避險。比較 TLT 與 GLD 的 12 個月報酬率。")
     
@@ -226,10 +224,7 @@ if not is_bull_market:
     st.success(f"🛡️ 本月建議持倉: **{best_hedge}** (100% 權重)")
 
 else:
-    # 🐂 進攻模式
     st.header("2️⃣ 第二階段 (B)：進攻模式 (Risk-On)")
-    
-    # --- Alpha Filter ---
     st.subheader("篩選：Alpha 濾網")
     st.caption("條件：(1M Alpha > 0) OR (12M Alpha > 0)")
     
@@ -240,7 +235,6 @@ else:
         bench = live_assets_map[ticker]
         try:
             beta = calculate_daily_beta(ticker, bench, daily_ret, lookback=252)
-            
             r_asset_1m = monthly_ret.loc[cutoff_date, ticker]
             r_bench_1m = monthly_ret.loc[cutoff_date, bench]
             alpha_1m = r_asset_1m - (beta * r_bench_1m)
@@ -248,27 +242,18 @@ else:
             p_now = monthly_prices.loc[cutoff_date, ticker]
             p_12m = monthly_prices.iloc[-13][ticker]
             r_asset_12m = (p_now / p_12m) - 1
-            
             p_b_now = monthly_prices.loc[cutoff_date, bench]
             p_b_12m = monthly_prices.iloc[-13][bench]
             r_bench_12m = (p_b_now / p_b_12m) - 1
-            
             alpha_12m = r_asset_12m - (beta * r_bench_12m)
             
             is_pass = (alpha_1m > 0) or (alpha_12m > 0)
-            
-            if is_pass:
-                survivors.append(ticker)
-                
+            if is_pass: survivors.append(ticker)
             filter_data.append({
-                'Ticker': ticker,
-                'Pass': '✅' if is_pass else '',
-                '1M Alpha': alpha_1m,
-                '12M Alpha': alpha_12m,
-                'Beta': beta
+                'Ticker': ticker, 'Pass': '✅' if is_pass else '',
+                '1M Alpha': alpha_1m, '12M Alpha': alpha_12m, 'Beta': beta
             })
-        except Exception as e:
-            continue
+        except: continue
             
     df_filter = pd.DataFrame(filter_data)
     st.dataframe(df_filter.style.format({
@@ -279,10 +264,8 @@ else:
         st.error("⚠️ 沒有標的通過 Alpha 濾網。建議轉為持有備用資產 (VT) 或現金。")
         st.stop()
         
-    # --- Scoring & Ranking ---
     st.subheader("排名：綜合動能 (75%) + 品質 (25%)")
     
-    # 準備計算 Z-Score 的數據集
     metrics_df = pd.DataFrame(index=survivors)
     for ticker in survivors:
         try:
@@ -291,12 +274,10 @@ else:
                 p_prev = monthly_prices.iloc[-1-p][ticker]
                 r = (p_now / p_prev) - 1
                 metrics_df.loc[ticker, f'R_{p}M'] = r
-            
             fip = calculate_fip(daily_ret[ticker])
             metrics_df.loc[ticker, 'FIP'] = fip
         except: continue
         
-    # 計算 Z-Score
     z_df = pd.DataFrame(index=survivors)
     mom_z_cols = []
     for p in periods:
@@ -307,60 +288,32 @@ else:
     z_df['Avg_Mom_Z'] = z_df[mom_z_cols].mean(axis=1)
     z_df['Z_FIP'] = zscore(metrics_df['FIP'], ddof=1, nan_policy='omit')
     
-    # 計算分數與貢獻
     z_df['Mom_Contrib (75%)'] = z_df['Avg_Mom_Z'] * 0.75
     z_df['FIP_Contrib (25%)'] = z_df['Z_FIP'] * 0.25
     z_df['Total_Score'] = z_df['Mom_Contrib (75%)'] + z_df['FIP_Contrib (25%)']
     
-    # 排序
     z_df = z_df.sort_values(by='Total_Score', ascending=False)
     top_3 = z_df.head(3).index.tolist()
     
-    # 合併原始數據
     metrics_df['Total_Score'] = z_df['Total_Score']
     metrics_df = metrics_df.loc[z_df.index]
 
-    # Tabs 切換
     tab_z, tab_raw = st.tabs(["📊 標準化數據 (Z-Score & 貢獻)", "🔢 原始數據 (報酬率 & FIP)"])
 
     with tab_z:
         st.caption("此表顯示經過標準化 (Z-Score) 後的分數，用於最終排名。")
         z_display_cols = ['Total_Score', 'Mom_Contrib (75%)', 'FIP_Contrib (25%)', 'Avg_Mom_Z', 'Z_FIP']
-        st.dataframe(
-            z_df[z_display_cols],
-            use_container_width=True,
-            column_config={
-                "Total_Score": st.column_config.NumberColumn("總分", format="%.2f"),
-                "Mom_Contrib (75%)": st.column_config.NumberColumn("動能貢獻", format="%.2f", help="動能 Z 分數 x 0.75"),
-                "FIP_Contrib (25%)": st.column_config.NumberColumn("品質貢獻", format="%.2f", help="FIP Z 分數 x 0.25"),
-                "Avg_Mom_Z": st.column_config.NumberColumn("原始動能 Z", format="%.2f"),
-                "Z_FIP": st.column_config.NumberColumn("原始 FIP Z", format="%.2f"),
-            }
-        )
+        st.dataframe(z_df[z_display_cols], use_container_width=True, column_config={"Total_Score": st.column_config.NumberColumn("總分", format="%.2f")})
 
     with tab_raw:
         st.caption("此表顯示未經處理的原始報酬率與 FIP 百分比。")
         display_raw_df = metrics_df.copy()
         pct_cols = ['FIP'] + [f'R_{p}M' for p in periods]
         display_raw_df[pct_cols] = display_raw_df[pct_cols] * 100
-        
         raw_display_cols = ['Total_Score', 'FIP'] + [f'R_{p}M' for p in periods]
-        st.dataframe(
-            display_raw_df[raw_display_cols],
-            use_container_width=True,
-            column_config={
-                "Total_Score": st.column_config.NumberColumn("總分", format="%.2f"),
-                "FIP": st.column_config.NumberColumn("FIP (正報酬天數)", format="%.2f%%"),
-                "R_3M": st.column_config.NumberColumn("3M 報酬", format="%.2f%%"),
-                "R_6M": st.column_config.NumberColumn("6M 報酬", format="%.2f%%"),
-                "R_9M": st.column_config.NumberColumn("9M 報酬", format="%.2f%%"),
-                "R_12M": st.column_config.NumberColumn("12M 報酬", format="%.2f%%"),
-            }
-        )
+        st.dataframe(display_raw_df[raw_display_cols], use_container_width=True, column_config={"Total_Score": st.column_config.NumberColumn("總分", format="%.2f")})
     
-    # --- 2.3 資金配置 (Allocation) ---
     st.subheader("🏆 最終資金配置 (Top 3 等權重)")
-    
     cols = st.columns(len(top_3))
     for i, ticker in enumerate(top_3):
         with cols[i]:
@@ -386,7 +339,6 @@ st.header("⏳ 歷史回測分析 (Backtest)")
 st.caption("回測設定：使用 DFEVX (長歷史版本)、無 DEHP。基準為 VT。")
 
 if st.button("🚀 開始執行回測 (Run Backtest)"):
-    # 1. 確定回測起始點 (需所有回測標的都有數據)
     check_tickers = backtest_tickers + safe_pool + ['VT']
     valid_starts = prices[check_tickers].apply(lambda x: x.first_valid_index())
     latest_start = valid_starts.max()
@@ -406,7 +358,6 @@ if st.button("🚀 開始執行回測 (Run Backtest)"):
     progress_bar = st.progress(0)
     total_steps = len(dates) - 1 - start_idx
     
-    # 為 Alpha Filter 建立一個 backtest 專用的 assets map
     bt_assets_map = {t: live_assets_map.get(t, 'VTI') for t in backtest_tickers}
     bt_assets_map['DFEVX'] = 'EEM' 
 
@@ -420,7 +371,6 @@ if st.button("🚀 開始執行回測 (Run Backtest)"):
         hist_monthly = monthly_prices.loc[:curr_date]
         hist_monthly_ret = monthly_ret.loc[:curr_date]
         
-        # A. 判斷市場狀態 (Count >= 6)
         neg_count = 0
         for t in backtest_tickers:
             try:
@@ -432,11 +382,9 @@ if st.button("🚀 開始執行回測 (Run Backtest)"):
             except: continue
             
         is_bear = neg_count >= 6
-        
         selected_tickers = []
         
         if is_bear:
-            # 避險: TLT vs GLD (12M)
             best_hedge = 'TLT'
             best_ret = -999
             for asset in ['TLT', 'GLD']:
@@ -449,36 +397,27 @@ if st.button("🚀 開始執行回測 (Run Backtest)"):
                         best_hedge = asset
                 except: pass
             selected_tickers = [best_hedge]
-            
         else:
-            # 進攻: Top 3
             survivors = []
             for t in backtest_tickers:
                 bench = bt_assets_map.get(t, 'VTI')
                 try:
-                    # Beta
                     subset = hist_daily[[t, bench]].tail(252).dropna()
                     if len(subset) > 200:
                         cov = np.cov(subset[t], subset[bench])
                         beta = cov[0, 1] / cov[1, 1]
                     else: beta = 1.0
-                    
-                    # Alpha Check
                     r_1m = hist_monthly_ret.iloc[-1][t]
                     b_1m = hist_monthly_ret.iloc[-1][bench]
                     a_1m = r_1m - beta * b_1m
-                    
                     p_now = hist_monthly.iloc[-1][t]
                     p_12m = hist_monthly.iloc[-13][t]
                     r_12m = (p_now / p_12m) - 1
-                    
                     p_b_now = hist_monthly.iloc[-1][bench]
                     p_b_12m = hist_monthly.iloc[-13][bench]
                     b_12m = (p_b_now / p_b_12m) - 1
                     a_12m = r_12m - beta * b_12m
-                    
-                    if a_1m > 0 or a_12m > 0:
-                        survivors.append(t)
+                    if a_1m > 0 or a_12m > 0: survivors.append(t)
                 except: continue
             
             if survivors:
@@ -501,17 +440,12 @@ if st.button("🚀 開始執行回測 (Run Backtest)"):
                         col = f'Z_{p}'
                         z_df[col] = zscore(m_df[f'M_{p}'], ddof=1, nan_policy='omit')
                         mom_z_cols.append(col)
-                    
                     z_df['Avg_Mom_Z'] = z_df[mom_z_cols].mean(axis=1)
                     z_df['Z_FIP'] = zscore(m_df['FIP'], ddof=1, nan_policy='omit')
                     z_df['Score'] = 0.75 * z_df['Avg_Mom_Z'] + 0.25 * z_df['Z_FIP']
-                    
                     selected_tickers = z_df.sort_values('Score', ascending=False).head(3).index.tolist()
-            
-            if not selected_tickers:
-                selected_tickers = ['VT'] # Fallback
+            if not selected_tickers: selected_tickers = ['VT']
                 
-        # 計算績效
         final_ret = monthly_ret.loc[next_date, selected_tickers].mean()
         portfolio_log.append({'Date': next_date, 'Strategy': final_ret})
         
@@ -522,81 +456,79 @@ if st.button("🚀 開始執行回測 (Run Backtest)"):
     res_df['Equity'] = (1 + res_df['Strategy']).cumprod()
     res_df['DD'] = res_df['Equity'] / res_df['Equity'].cummax() - 1
     
-    # Benchmark Stats (VT)
     bench_ret = monthly_ret['VT'].loc[res_df.index]
     bench_equity = (1 + bench_ret).cumprod()
     bench_dd = bench_equity / bench_equity.cummax() - 1
     
-    # Stats Calculation
-    years = len(res_df) / 12
-    rf_rate = 0.0
-    
-    # Benchmark Metrics
-    bench_cagr = (bench_equity.iloc[-1]) ** (1/years) - 1
-    bench_mdd = bench_dd.min()
-    bench_neg = bench_ret[bench_ret < 0]
-    bench_down_std = bench_neg.std() * np.sqrt(12) if len(bench_neg) > 0 else 1e-6
-    bench_sortino = (bench_ret.mean() * 12 - rf_rate) / bench_down_std
-    bench_sharpe = (bench_ret.mean() * 12 - rf_rate) / (bench_ret.std() * np.sqrt(12))
-    bench_roll5y = bench_equity.rolling(60).apply(lambda x: (x.iloc[-1]/x.iloc[0])**(1/5) - 1).mean()
-
-    # Strategy Metrics
     total_ret = res_df['Equity'].iloc[-1] - 1
+    years = len(res_df) / 12
     cagr = (res_df['Equity'].iloc[-1]) ** (1/years) - 1
     mdd = res_df['DD'].min()
-    strat_ret_series = res_df['Strategy']
-    sharpe = (strat_ret_series.mean() * 12 - rf_rate) / (strat_ret_series.std() * np.sqrt(12))
-    neg_rets = strat_ret_series[strat_ret_series < 0]
+    
+    neg_rets = res_df.loc[res_df['Strategy'] < 0, 'Strategy']
     down_std = neg_rets.std() * np.sqrt(12) if len(neg_rets) > 0 else 1e-6
-    sortino = (strat_ret_series.mean() * 12 - rf_rate) / down_std
+    sortino = (res_df['Strategy'].mean() * 12) / down_std
+    sharpe = (res_df['Strategy'].mean() * 12) / (res_df['Strategy'].std() * np.sqrt(12))
+    
     roll5y = res_df['Equity'].rolling(60).apply(lambda x: (x.iloc[-1]/x.iloc[0])**(1/5) - 1).mean()
     
-    # Display Helper
-    def display_metric_pair(label, val_strat, val_bench, fmt="{:.2%}"):
-        st.markdown(f"""
-        <div style="margin-bottom: 10px;">
-            <p style="font-size: 14px; margin-bottom: 0px; color: #888;">{label}</p>
-            <span style="font-size: 24px; font-weight: bold;">{fmt.format(val_strat)}</span>
-            <span style="font-size: 14px; color: gray; margin-left: 8px;">(VT: {fmt.format(val_bench)})</span>
-        </div>
-        """, unsafe_allow_html=True)
-
-    # 顯示數據
-    c1, c2, c3, c4, c5 = st.columns(5)
-    with c1: display_metric_pair("CAGR (年化)", cagr, bench_cagr)
-    with c2: display_metric_pair("MDD (最大回撤)", mdd, bench_mdd)
-    with c3: display_metric_pair("Sharpe Ratio", sharpe, bench_sharpe, "{:.2f}")
-    with c4: display_metric_pair("Sortino Ratio", sortino, bench_sortino, "{:.2f}")
-    with c5: display_metric_pair("Avg Rolling 5Y", roll5y, bench_roll5y)
+    # 指標顯示
+    col_m1, col_m2, col_m3, col_m4, col_m5 = st.columns(5)
+    col_m1.metric("CAGR (年化)", f"{cagr:.2%}")
+    col_m2.metric("MDD (最大回撤)", f"{mdd:.2%}")
+    col_m3.metric("Sharpe Ratio", f"{sharpe:.2f}")
+    col_m4.metric("Sortino Ratio", f"{sortino:.2f}")
+    col_m5.metric("Avg Rolling 5Y", f"{roll5y:.2%}")
     
-    st.divider()
-
-    # 顏色設定：Strategy (深藍), Benchmark (淺藍)
-    color_scheme = ['#03045E', '#00B4D8']
-
-    # 1. 權益曲線 (累積報酬率 %)
-    st.subheader("📈 權益曲線 (Strategy vs VT)")
-    chart_data = pd.DataFrame({
-        'Strategy': (res_df['Equity'] - 1) * 100,
-        'Benchmark (VT)': (bench_equity - 1) * 100
-    })
-    st.line_chart(chart_data, color=color_scheme)
+    # 繪圖 (使用 Altair)
     
-    # 2. 回撤圖 (%)
-    st.subheader("📉 回撤圖 (Drawdown)")
-    dd_data = pd.DataFrame({
-        'Strategy': res_df['DD'] * 100,
-        'Benchmark (VT)': bench_dd * 100
-    })
-    st.line_chart(dd_data, color=color_scheme)
+    # A. 權益曲線
+    df_chart = pd.DataFrame({
+        'Date': res_df.index,
+        'Strategy': (res_df['Equity'] - 1), 
+        'Benchmark (VT)': (bench_equity - 1)
+    }).melt('Date', var_name='Asset', value_name='Return')
     
-    # 3. 滾動 5 年報酬 (%)
-    st.subheader("🔄 滾動 5 年年化報酬 (Rolling 5-Year CAGR)")
+    chart_equity = alt.Chart(df_chart).mark_line().encode(
+        x='Date',
+        y=alt.Y('Return', axis=alt.Axis(format='%')),
+        color=alt.Color('Asset', scale=alt.Scale(domain=['Strategy', 'Benchmark (VT)'], range=['#FFD700', '#00B4D8'])), # Gold vs Light Blue
+        tooltip=['Date', 'Asset', alt.Tooltip('Return', format='.2%')]
+    ).properties(title='累積報酬率 (Cumulative Return)')
+    
+    st.altair_chart(chart_equity, use_container_width=True)
+    
+    # B. 回撤圖
+    df_dd = pd.DataFrame({
+        'Date': res_df.index,
+        'Strategy': res_df['DD'],
+        'Benchmark (VT)': bench_dd
+    }).melt('Date', var_name='Asset', value_name='Drawdown')
+    
+    chart_dd = alt.Chart(df_dd).mark_line().encode(
+        x='Date',
+        y=alt.Y('Drawdown', axis=alt.Axis(format='%')),
+        color=alt.Color('Asset', scale=alt.Scale(domain=['Strategy', 'Benchmark (VT)'], range=['#FFD700', '#00B4D8'])),
+        tooltip=['Date', 'Asset', alt.Tooltip('Drawdown', format='.2%')]
+    ).properties(title='回撤 (Drawdown)')
+    
+    st.altair_chart(chart_dd, use_container_width=True)
+    
+    # C. 滾動 5 年
     roll_strat = res_df['Equity'].rolling(60).apply(lambda x: (x.iloc[-1]/x.iloc[0])**(1/5) - 1)
     roll_bench = bench_equity.rolling(60).apply(lambda x: (x.iloc[-1]/x.iloc[0])**(1/5) - 1)
     
-    roll_data = pd.DataFrame({
-        'Strategy': roll_strat * 100,
-        'Benchmark (VT)': roll_bench * 100
-    })
-    st.line_chart(roll_data, color=color_scheme)
+    df_roll = pd.DataFrame({
+        'Date': res_df.index,
+        'Strategy': roll_strat,
+        'Benchmark (VT)': roll_bench
+    }).dropna().melt('Date', var_name='Asset', value_name='Rolling CAGR')
+    
+    chart_roll = alt.Chart(df_roll).mark_line().encode(
+        x='Date',
+        y=alt.Y('Rolling CAGR', axis=alt.Axis(format='%')),
+        color=alt.Color('Asset', scale=alt.Scale(domain=['Strategy', 'Benchmark (VT)'], range=['#FFD700', '#00B4D8'])),
+        tooltip=['Date', 'Asset', alt.Tooltip('Rolling CAGR', format='.2%')]
+    ).properties(title='滾動 5 年年化報酬 (Rolling 5-Year CAGR)')
+    
+    st.altair_chart(chart_roll, use_container_width=True)

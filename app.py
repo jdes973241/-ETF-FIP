@@ -12,7 +12,7 @@ st.set_page_config(page_title="多重資產動能策略", layout="wide")
 st.title("🛡️ 多重資產因子動能輪動策略 (Live & Backtest)")
 st.markdown("""
 **策略邏輯摘要：**
-1.  **市場狀態 (Regime)**：計算 12 檔股票因子的平均動能。若 < 0 則全面避險；若 > 0 則進攻。
+1.  **市場狀態 (Regime)**：計算 12 檔股票因子的平均動能。若 **>= 6 檔** 動能轉負，則全面避險；否則進攻。
 2.  **避險模式 (Risk-Off)**：比較 **TLT** 與 **GLD** 的 12 個月報酬，全倉持有強者。
 3.  **進攻模式 (Risk-On)**：
     * **濾網**：Alpha (1M 或 12M > 0)。
@@ -106,7 +106,6 @@ def load_and_process_data():
     monthly_ret = monthly_prices.pct_change()
     daily_ret = prices.pct_change()
     
-    # 修正：回傳 prices 以供回測使用
     return prices, monthly_ret, daily_ret, monthly_prices, live_assets_map, backtest_assets, safe_pool, cutoff_date, msg
 
 # ==========================================
@@ -115,10 +114,9 @@ def load_and_process_data():
 data_pack = load_and_process_data()
 
 if data_pack[0] is None:
-    st.error(data_pack[8]) # Error msg is now at index 8
+    st.error(data_pack[9])
     st.stop()
 
-# 修正：接收 prices
 prices, monthly_ret, daily_ret, monthly_prices, live_assets_map, backtest_tickers, safe_pool, cutoff_date, status_msg = data_pack
 equity_tickers = list(live_assets_map.keys())
 
@@ -137,13 +135,13 @@ with st.sidebar:
     st.divider()
 
 # ==========================================
-# 第一階段：市場狀態判斷 (Regime Filter)
+# 第一階段：市場狀態判斷 (Count-Based Regime)
 # ==========================================
 st.subheader("1️⃣ 第一階段：市場狀態判斷 (Regime Filter)")
 
 periods = [3, 6, 9, 12]
 regime_stats = []
-mom_sum = 0
+neg_count = 0 
 valid_count = 0
 
 for ticker in equity_tickers:
@@ -159,29 +157,39 @@ for ticker in equity_tickers:
             p_vals.append(r)
             
         ticker_avg_mom /= 4
+        
+        # 判斷正負
+        status_icon = "🟢" if ticker_avg_mom > 0 else "🔴"
+        if ticker_avg_mom < 0:
+            neg_count += 1
+            
         regime_stats.append({
             'Ticker': ticker,
+            'Status': status_icon,
             'Avg_Mom': ticker_avg_mom,
             '3M': p_vals[0], '6M': p_vals[1], '9M': p_vals[2], '12M': p_vals[3]
         })
         
         if not np.isnan(ticker_avg_mom):
-            mom_sum += ticker_avg_mom
             valid_count += 1
     except Exception as e:
         continue
 
-universe_mom = mom_sum / valid_count if valid_count > 0 else 0
-is_bull_market = universe_mom > 0
+# 判斷邏輯：若負動能數量 >= 6，則為熊市
+THRESHOLD_N = 6
+is_bull_market = neg_count < THRESHOLD_N
 
 col1, col2 = st.columns([1, 2])
-col1.metric("全市場平均動能", f"{universe_mom:.2%}", delta_color="normal")
+col1.metric("轉弱標的數量 (Count < 0)", f"{neg_count} / {valid_count}", delta_color="inverse")
 status_text = "🐂 牛市 (進攻模式)" if is_bull_market else "🐻 熊市 (避險模式)"
 status_color = "green" if is_bull_market else "red"
 col2.markdown(f"### 市場狀態: :{status_color}[{status_text}]")
+col2.caption(f"避險觸發條件：轉弱標的數量 >= {THRESHOLD_N} (總數 12)")
 
 with st.expander("查看全市場 12 檔 ETF 動能細節"):
-    st.dataframe(pd.DataFrame(regime_stats).style.format("{:.2%}", subset=['Avg_Mom', '3M', '6M', '9M', '12M']))
+    df_regime = pd.DataFrame(regime_stats)
+    cols = ['Ticker', 'Status', 'Avg_Mom', '3M', '6M', '9M', '12M']
+    st.dataframe(df_regime[cols].style.format("{:.2%}", subset=['Avg_Mom', '3M', '6M', '9M', '12M']))
 
 st.divider()
 
@@ -192,7 +200,7 @@ st.divider()
 if not is_bull_market:
     # 🐻 避險模式
     st.header("2️⃣ 第二階段 (A)：避險模式 (Risk-Off)")
-    st.info("全市場動能 < 0，啟動避險。比較 TLT 與 GLD 的 12 個月報酬率。")
+    st.info(f"轉弱標的達 {neg_count} 檔 (>= {THRESHOLD_N})，啟動避險。比較 TLT 與 GLD 的 12 個月報酬率。")
     
     hedge_stats = []
     best_hedge = None
@@ -274,7 +282,6 @@ else:
     # --- Scoring & Ranking ---
     st.subheader("排名：綜合動能 (75%) + 品質 (25%)")
     
-    # 準備計算 Z-Score 的數據集
     metrics_df = pd.DataFrame(index=survivors)
     for ticker in survivors:
         try:
@@ -288,7 +295,6 @@ else:
             metrics_df.loc[ticker, 'FIP'] = fip
         except: continue
         
-    # 計算 Z-Score
     z_df = pd.DataFrame(index=survivors)
     mom_z_cols = []
     for p in periods:
@@ -299,20 +305,16 @@ else:
     z_df['Avg_Mom_Z'] = z_df[mom_z_cols].mean(axis=1)
     z_df['Z_FIP'] = zscore(metrics_df['FIP'], ddof=1, nan_policy='omit')
     
-    # 計算分數與貢獻
     z_df['Mom_Contrib (75%)'] = z_df['Avg_Mom_Z'] * 0.75
     z_df['FIP_Contrib (25%)'] = z_df['Z_FIP'] * 0.25
     z_df['Total_Score'] = z_df['Mom_Contrib (75%)'] + z_df['FIP_Contrib (25%)']
     
-    # 排序
     z_df = z_df.sort_values(by='Total_Score', ascending=False)
     top_3 = z_df.head(3).index.tolist()
     
-    # 合併原始數據
     metrics_df['Total_Score'] = z_df['Total_Score']
     metrics_df = metrics_df.loc[z_df.index]
 
-    # Tabs 切換
     tab_z, tab_raw = st.tabs(["📊 標準化數據 (Z-Score & 貢獻)", "🔢 原始數據 (報酬率 & FIP)"])
 
     with tab_z:
@@ -378,7 +380,7 @@ st.header("⏳ 歷史回測分析 (Backtest)")
 st.caption("回測設定：使用 DFEVX (長歷史版本)、無 DEHP。基準為 VT。")
 
 if st.button("🚀 開始執行回測 (Run Backtest)"):
-    # 1. 確定回測起始點 (需所有回測標的都有數據)
+    # 1. 準備回測數據
     check_tickers = backtest_tickers + safe_pool + ['VT']
     valid_starts = prices[check_tickers].apply(lambda x: x.first_valid_index())
     latest_start = valid_starts.max()
@@ -398,7 +400,7 @@ if st.button("🚀 開始執行回測 (Run Backtest)"):
     progress_bar = st.progress(0)
     total_steps = len(dates) - 1 - start_idx
     
-    # 為 Alpha Filter 建立一個 backtest 專用的 assets map
+    # 回測用 Map (補齊 Benchmark 對應)
     bt_assets_map = {t: live_assets_map.get(t, 'VTI') for t in backtest_tickers}
     bt_assets_map['DFEVX'] = 'EEM' 
 
@@ -412,7 +414,7 @@ if st.button("🚀 開始執行回測 (Run Backtest)"):
         hist_monthly = monthly_prices.loc[:curr_date]
         hist_monthly_ret = monthly_ret.loc[:curr_date]
         
-        # A. 判斷市場狀態 (Count >= 6 on Backtest Tickers)
+        # A. 判斷市場狀態 (Count >= 6)
         neg_count = 0
         for t in backtest_tickers:
             try:
@@ -420,7 +422,6 @@ if st.button("🚀 開始執行回測 (Run Backtest)"):
                 avg_mom = 0
                 for p in [3, 6, 9, 12]:
                     avg_mom += (p_now / hist_monthly.iloc[-1-p][t]) - 1
-                avg_mom /= 4 
                 if avg_mom < 0: neg_count += 1
             except: continue
             
@@ -515,33 +516,80 @@ if st.button("🚀 開始執行回測 (Run Backtest)"):
     res_df['Equity'] = (1 + res_df['Strategy']).cumprod()
     res_df['DD'] = res_df['Equity'] / res_df['Equity'].cummax() - 1
     
-    # Benchmark
+    # Benchmark Stats (VT)
     bench_ret = monthly_ret['VT'].loc[res_df.index]
     bench_equity = (1 + bench_ret).cumprod()
-    res_df['Benchmark'] = bench_equity
+    bench_dd = bench_equity / bench_equity.cummax() - 1
     
-    # 統計數據
-    total_ret = res_df['Equity'].iloc[-1] - 1
+    bench_cagr = (bench_equity.iloc[-1]) ** (12 / len(res_df)) - 1
+    bench_mdd = bench_dd.min()
+    
+    rf_rate = 0.0
+    bench_sharpe = (bench_ret.mean() * 12 - rf_rate) / (bench_ret.std() * np.sqrt(12))
+    
+    bench_neg = bench_ret[bench_ret < 0]
+    bench_down_std = bench_neg.std() * np.sqrt(12) if len(bench_neg) > 0 else 1e-6
+    bench_sortino = (bench_ret.mean() * 12 - rf_rate) / bench_down_std
+    
+    bench_roll5y = bench_equity.rolling(60).apply(lambda x: (x.iloc[-1]/x.iloc[0])**(1/5) - 1).mean()
+
+    # Strategy Stats
     years = len(res_df) / 12
     cagr = (res_df['Equity'].iloc[-1]) ** (1/years) - 1
     mdd = res_df['DD'].min()
     
-    neg_rets = res_df.loc[res_df['Strategy'] < 0, 'Strategy']
+    strat_ret_series = res_df['Strategy']
+    sharpe = (strat_ret_series.mean() * 12 - rf_rate) / (strat_ret_series.std() * np.sqrt(12))
+    
+    neg_rets = strat_ret_series[strat_ret_series < 0]
     down_std = neg_rets.std() * np.sqrt(12) if len(neg_rets) > 0 else 1e-6
-    sortino = (res_df['Strategy'].mean() * 12) / down_std
+    sortino = (strat_ret_series.mean() * 12 - rf_rate) / down_std
     
-    # 顯示指標
-    col_m1, col_m2, col_m3, col_m4 = st.columns(4)
-    col_m1.metric("CAGR (年化報酬)", f"{cagr:.2%}")
-    col_m2.metric("MDD (最大回撤)", f"{mdd:.2%}")
-    col_m3.metric("Sortino Ratio", f"{sortino:.2f}")
-    col_m4.metric("總報酬率", f"{total_ret:.2%}")
+    roll5y = res_df['Equity'].rolling(60).apply(lambda x: (x.iloc[-1]/x.iloc[0])**(1/5) - 1).mean()
     
+    # Helper to display metrics
+    def display_metric_pair(label, val_strat, val_bench, fmt="{:.2%}"):
+        st.markdown(f"""
+        <div style="margin-bottom: 10px;">
+            <p style="font-size: 14px; margin-bottom: 0px; color: #888;">{label}</p>
+            <span style="font-size: 24px; font-weight: bold;">{fmt.format(val_strat)}</span>
+            <span style="font-size: 14px; color: gray; margin-left: 8px;">(VT: {fmt.format(val_bench)})</span>
+        </div>
+        """, unsafe_allow_html=True)
+
+    # 顯示數據
+    c1, c2, c3, c4, c5 = st.columns(5)
+    with c1: display_metric_pair("CAGR (年化)", cagr, bench_cagr)
+    with c2: display_metric_pair("MDD (最大回撤)", mdd, bench_mdd)
+    with c3: display_metric_pair("Sharpe Ratio", sharpe, bench_sharpe, "{:.2f}")
+    with c4: display_metric_pair("Sortino Ratio", sortino, bench_sortino, "{:.2f}")
+    with c5: display_metric_pair("Avg Rolling 5Y", roll5y, bench_roll5y)
+    
+    st.divider()
+
     # 繪圖
     st.subheader("📈 權益曲線 (Strategy vs VT)")
-    chart_data = pd.concat([res_df['Equity'], bench_equity], axis=1)
-    chart_data.columns = ['Strategy', 'Benchmark (VT)']
+    chart_data = pd.DataFrame({
+        'Strategy': res_df['Equity'],
+        'Benchmark (VT)': bench_equity
+    })
     st.line_chart(chart_data)
     
-    st.subheader("📉 回撤圖 (Drawdown)")
-    st.area_chart(res_df['DD'], color='#ff4b4b')
+    st.subheader("📉 回撤圖 (Drawdown Comparison)")
+    dd_data = pd.DataFrame({
+        'Strategy DD': res_df['DD'],
+        'Benchmark DD': bench_dd
+    })
+    # 使用 area chart 畫策略，line chart 畫 benchmark 可能比較清楚，但 streamlit area_chart 只能堆疊或並列
+    # 這裡直接用 line chart 比較清楚
+    st.line_chart(dd_data, color=['#ff4b4b', '#808080'])
+    
+    st.subheader("🔄 滾動 5 年年化報酬 (Rolling 5-Year CAGR)")
+    roll_strat = res_df['Equity'].rolling(60).apply(lambda x: (x.iloc[-1]/x.iloc[0])**(1/5) - 1)
+    roll_bench = bench_equity.rolling(60).apply(lambda x: (x.iloc[-1]/x.iloc[0])**(1/5) - 1)
+    
+    roll_data = pd.DataFrame({
+        'Strategy 5Y': roll_strat,
+        'Benchmark 5Y': roll_bench
+    })
+    st.line_chart(roll_data)

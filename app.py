@@ -9,15 +9,15 @@ from datetime import datetime, timedelta
 # 頁面設定
 # ==========================================
 st.set_page_config(page_title="多重資產動能策略", layout="wide")
-st.title("🛡️ 多重資產因子動能輪動策略 (Final Optimized)")
+st.title("🛡️ 多重資產因子動能輪動策略 (Final Deployment)")
 st.markdown("""
-**策略邏輯摘要：**
-1.  **市場狀態 (Regime)**：計算 12 檔股票因子的平均動能。若 < 0 則全面避險；若 > 0 則進攻。
+**策略執行邏輯：**
+1.  **市場狀態 (Regime)**：監控 12 檔股票因子的動能。若 **>= 6 檔** 動能轉負，則全面避險；否則進攻。
 2.  **避險模式 (Risk-Off)**：比較 **TLT** 與 **GLD** 的 12 個月報酬，全倉持有強者。
 3.  **進攻模式 (Risk-On)**：
     * **濾網**：Alpha (1M 或 12M > 0)。
     * **排名**：動能 (3+6+9+12M) 75% + 品質 (FIP) 25%。
-    * **配置**：持有前 3 名，等權重。
+    * **配置**：持有前 3 名，等權重 (33.3%)。
 """)
 
 # ==========================================
@@ -37,7 +37,7 @@ def calculate_fip(daily_series, lookback=252):
 
 @st.cache_data(ttl=3600)
 def load_and_process_data():
-    # 1. 定義資產池
+    # 1. 定義資產池 (恢復 DEHP, DFEV)
     assets_map = {
         # 國際已開發
         'IMOM': 'EFA', 'IVAL': 'EFA', 'IDHQ': 'EFA', 'GWX': 'EFA',
@@ -132,13 +132,13 @@ with st.sidebar:
     st.divider()
 
 # ==========================================
-# 第一階段：市場狀態判斷 (Regime Filter)
+# 第一階段：市場狀態判斷 (Count-Based Regime)
 # ==========================================
 st.subheader("1️⃣ 第一階段：市場狀態判斷 (Regime Filter)")
 
 periods = [3, 6, 9, 12]
 regime_stats = []
-mom_sum = 0
+neg_count = 0 
 valid_count = 0
 
 for ticker in equity_tickers:
@@ -154,29 +154,39 @@ for ticker in equity_tickers:
             p_vals.append(r)
             
         ticker_avg_mom /= 4
+        
+        # 判斷正負
+        status_icon = "🟢" if ticker_avg_mom > 0 else "🔴"
+        if ticker_avg_mom < 0:
+            neg_count += 1
+            
         regime_stats.append({
             'Ticker': ticker,
+            'Status': status_icon,
             'Avg_Mom': ticker_avg_mom,
             '3M': p_vals[0], '6M': p_vals[1], '9M': p_vals[2], '12M': p_vals[3]
         })
         
         if not np.isnan(ticker_avg_mom):
-            mom_sum += ticker_avg_mom
             valid_count += 1
     except Exception as e:
         continue
 
-universe_mom = mom_sum / valid_count if valid_count > 0 else 0
-is_bull_market = universe_mom > 0
+# 判斷邏輯：若負動能數量 >= 6，則為熊市
+THRESHOLD_N = 6
+is_bull_market = neg_count < THRESHOLD_N
 
 col1, col2 = st.columns([1, 2])
-col1.metric("全市場平均動能", f"{universe_mom:.2%}", delta_color="normal")
+col1.metric("轉弱標的數量 (Count < 0)", f"{neg_count} / {valid_count}", delta_color="inverse")
 status_text = "🐂 牛市 (進攻模式)" if is_bull_market else "🐻 熊市 (避險模式)"
 status_color = "green" if is_bull_market else "red"
 col2.markdown(f"### 市場狀態: :{status_color}[{status_text}]")
+col2.caption(f"避險觸發條件：轉弱標的數量 >= {THRESHOLD_N} (總數 12)")
 
 with st.expander("查看全市場 12 檔 ETF 動能細節"):
-    st.dataframe(pd.DataFrame(regime_stats).style.format("{:.2%}", subset=['Avg_Mom', '3M', '6M', '9M', '12M']))
+    df_regime = pd.DataFrame(regime_stats)
+    cols = ['Ticker', 'Status', 'Avg_Mom', '3M', '6M', '9M', '12M']
+    st.dataframe(df_regime[cols].style.format("{:.2%}", subset=['Avg_Mom', '3M', '6M', '9M', '12M']))
 
 st.divider()
 
@@ -189,7 +199,7 @@ if not is_bull_market:
     # 🐻 避險模式 (Risk-Off)
     # ==========================
     st.header("2️⃣ 第二階段 (A)：避險模式 (Risk-Off)")
-    st.info("全市場動能 < 0，啟動避險。比較 TLT 與 GLD 的 12 個月報酬率。")
+    st.info(f"轉弱標的達 {neg_count} 檔 (>= {THRESHOLD_N})，啟動避險。比較 TLT 與 GLD 的 12 個月報酬率。")
     
     hedge_stats = []
     best_hedge = None
@@ -198,7 +208,7 @@ if not is_bull_market:
     for asset in safe_pool:
         try:
             p_now = monthly_prices.loc[cutoff_date, asset]
-            p_12m = monthly_prices.iloc[-13][asset]
+            p_12m = monthly_prices.iloc[-13][asset] # 12個月前
             r_12m = (p_now / p_12m) - 1
             
             hedge_stats.append({'Asset': asset, '12M Return': r_12m})
@@ -230,7 +240,7 @@ else:
     for ticker in equity_tickers:
         bench = assets_map[ticker]
         try:
-            # 計算 Beta (最近 252 日)
+            # 計算 Beta
             beta = calculate_daily_beta(ticker, bench, daily_ret, lookback=252)
             
             # 1M 數據
@@ -290,7 +300,7 @@ else:
             metrics_df.loc[ticker, 'FIP'] = fip
         except: continue
         
-    # 計算 Z-Score
+    # 計算 Z-Score (橫截面)
     z_df = pd.DataFrame(index=survivors)
     mom_z_cols = []
     for p in periods:
@@ -310,17 +320,16 @@ else:
     z_df = z_df.sort_values(by='Total_Score', ascending=False)
     top_3 = z_df.head(3).index.tolist()
     
-    # 將總分合併回原始數據以便顯示
+    # 合併原始數據
     metrics_df['Total_Score'] = z_df['Total_Score']
     metrics_df = metrics_df.loc[z_df.index]
 
-    # --- 使用 Tabs 切換視圖 ---
+    # Tabs 切換
     tab_z, tab_raw = st.tabs(["📊 標準化數據 (Z-Score & 貢獻)", "🔢 原始數據 (報酬率 & FIP)"])
 
     with tab_z:
         st.caption("此表顯示經過標準化 (Z-Score) 後的分數，用於最終排名。")
         z_display_cols = ['Total_Score', 'Mom_Contrib (75%)', 'FIP_Contrib (25%)', 'Avg_Mom_Z', 'Z_FIP']
-        
         st.dataframe(
             z_df[z_display_cols],
             use_container_width=True,
@@ -335,14 +344,12 @@ else:
 
     with tab_raw:
         st.caption("此表顯示未經處理的原始報酬率與 FIP 百分比。")
-        
-        # 關鍵修正：建立一個副本並乘以 100 以顯示正確百分比
+        # 手動乘 100 以符合百分比顯示
         display_raw_df = metrics_df.copy()
         pct_cols = ['FIP'] + [f'R_{p}M' for p in periods]
         display_raw_df[pct_cols] = display_raw_df[pct_cols] * 100
         
         raw_display_cols = ['Total_Score', 'FIP'] + [f'R_{p}M' for p in periods]
-        
         st.dataframe(
             display_raw_df[raw_display_cols],
             use_container_width=True,

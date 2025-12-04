@@ -71,12 +71,12 @@ def load_and_process_data():
     elif 'Close' in raw_data.columns:
         prices = raw_data['Close']
     else:
-        return None, None, None, None, None, None, None, None, "❌ 嚴重錯誤: 無法下載價格資料"
+        return None, None, None, None, None, None, None, None, None, "❌ 嚴重錯誤: 無法下載價格資料"
 
     prices = prices.astype(float).ffill() # 填補空值
     
     if prices.empty:
-        return None, None, None, None, None, None, None, None, "❌ 錯誤: 下載的數據為空。"
+        return None, None, None, None, None, None, None, None, None, "❌ 錯誤: 下載的數據為空。"
 
     # 檢查數據新鮮度
     last_dt = prices.index[-1]
@@ -106,7 +106,8 @@ def load_and_process_data():
     monthly_ret = monthly_prices.pct_change()
     daily_ret = prices.pct_change()
     
-    return monthly_ret, daily_ret, monthly_prices, live_assets_map, backtest_assets, safe_pool, cutoff_date, msg
+    # 修正：回傳 prices 以供回測使用
+    return prices, monthly_ret, daily_ret, monthly_prices, live_assets_map, backtest_assets, safe_pool, cutoff_date, msg
 
 # ==========================================
 # 執行計算與顯示
@@ -114,10 +115,11 @@ def load_and_process_data():
 data_pack = load_and_process_data()
 
 if data_pack[0] is None:
-    st.error(data_pack[7])
+    st.error(data_pack[8]) # Error msg is now at index 8
     st.stop()
 
-monthly_ret, daily_ret, monthly_prices, live_assets_map, backtest_tickers, safe_pool, cutoff_date, status_msg = data_pack
+# 修正：接收 prices
+prices, monthly_ret, daily_ret, monthly_prices, live_assets_map, backtest_tickers, safe_pool, cutoff_date, status_msg = data_pack
 equity_tickers = list(live_assets_map.keys())
 
 # --- 側邊欄：市場快照 ---
@@ -330,7 +332,6 @@ else:
 
     with tab_raw:
         st.caption("此表顯示未經處理的原始報酬率與 FIP 百分比。")
-        # 手動乘 100
         display_raw_df = metrics_df.copy()
         pct_cols = ['FIP'] + [f'R_{p}M' for p in periods]
         display_raw_df[pct_cols] = display_raw_df[pct_cols] * 100
@@ -376,9 +377,8 @@ st.markdown("---")
 st.header("⏳ 歷史回測分析 (Backtest)")
 st.caption("回測設定：使用 DFEVX (長歷史版本)、無 DEHP。基準為 VT。")
 
-if st.button("🚀 開始回測 (Run Backtest)"):
+if st.button("🚀 開始執行回測 (Run Backtest)"):
     # 1. 確定回測起始點 (需所有回測標的都有數據)
-    # 我們需要預留 12個月 + 1個月
     check_tickers = backtest_tickers + safe_pool + ['VT']
     valid_starts = prices[check_tickers].apply(lambda x: x.first_valid_index())
     latest_start = valid_starts.max()
@@ -399,9 +399,7 @@ if st.button("🚀 開始回測 (Run Backtest)"):
     total_steps = len(dates) - 1 - start_idx
     
     # 為 Alpha Filter 建立一個 backtest 專用的 assets map
-    # 這裡簡單處理：若無對應，預設 VTI
     bt_assets_map = {t: live_assets_map.get(t, 'VTI') for t in backtest_tickers}
-    # 修正 DFEVX 對應
     bt_assets_map['DFEVX'] = 'EEM' 
 
     for i in range(start_idx, len(dates) - 1):
@@ -415,7 +413,6 @@ if st.button("🚀 開始回測 (Run Backtest)"):
         hist_monthly_ret = monthly_ret.loc[:curr_date]
         
         # A. 判斷市場狀態 (Count >= 6 on Backtest Tickers)
-        # 注意：回測時只使用回測池中的 11 檔來判斷
         neg_count = 0
         for t in backtest_tickers:
             try:
@@ -423,6 +420,7 @@ if st.button("🚀 開始回測 (Run Backtest)"):
                 avg_mom = 0
                 for p in [3, 6, 9, 12]:
                     avg_mom += (p_now / hist_monthly.iloc[-1-p][t]) - 1
+                avg_mom /= 4 
                 if avg_mom < 0: neg_count += 1
             except: continue
             
@@ -432,7 +430,7 @@ if st.button("🚀 開始回測 (Run Backtest)"):
         
         if is_bear:
             # 避險: TLT vs GLD (12M)
-            best_safe = 'TLT'
+            best_hedge = 'TLT'
             best_ret = -999
             for asset in ['TLT', 'GLD']:
                 try:
@@ -441,9 +439,9 @@ if st.button("🚀 開始回測 (Run Backtest)"):
                     r = (p_now / p_prev) - 1
                     if r > best_ret:
                         best_ret = r
-                        best_safe = asset
+                        best_hedge = asset
                 except: pass
-            selected_tickers = [best_safe]
+            selected_tickers = [best_hedge]
             
         else:
             # 進攻: Top 3
@@ -475,7 +473,7 @@ if st.button("🚀 開始回測 (Run Backtest)"):
                     if a_1m > 0 or a_12m > 0:
                         survivors.append(t)
                 except: continue
-                
+            
             if survivors:
                 metrics = []
                 for t in survivors:
@@ -520,8 +518,9 @@ if st.button("🚀 開始回測 (Run Backtest)"):
     # Benchmark
     bench_ret = monthly_ret['VT'].loc[res_df.index]
     bench_equity = (1 + bench_ret).cumprod()
+    res_df['Benchmark'] = bench_equity
     
-    # Stats
+    # 統計數據
     total_ret = res_df['Equity'].iloc[-1] - 1
     years = len(res_df) / 12
     cagr = (res_df['Equity'].iloc[-1]) ** (1/years) - 1
@@ -531,19 +530,17 @@ if st.button("🚀 開始回測 (Run Backtest)"):
     down_std = neg_rets.std() * np.sqrt(12) if len(neg_rets) > 0 else 1e-6
     sortino = (res_df['Strategy'].mean() * 12) / down_std
     
-    # Display Stats
-    c1, c2, c3, c4 = st.columns(4)
-    c1.metric("CAGR (年化)", f"{cagr:.2%}")
-    c2.metric("MDD (最大回撤)", f"{mdd:.2%}")
-    c3.metric("Sortino Ratio", f"{sortino:.2f}")
-    c4.metric("總報酬率", f"{total_ret:.2%}")
+    # 顯示指標
+    col_m1, col_m2, col_m3, col_m4 = st.columns(4)
+    col_m1.metric("CAGR (年化報酬)", f"{cagr:.2%}")
+    col_m2.metric("MDD (最大回撤)", f"{mdd:.2%}")
+    col_m3.metric("Sortino Ratio", f"{sortino:.2f}")
+    col_m4.metric("總報酬率", f"{total_ret:.2%}")
     
-    # Charts
+    # 繪圖
     st.subheader("📈 權益曲線 (Strategy vs VT)")
-    chart_data = pd.DataFrame({
-        'Strategy': res_df['Equity'],
-        'Benchmark (VT)': bench_equity
-    })
+    chart_data = pd.concat([res_df['Equity'], bench_equity], axis=1)
+    chart_data.columns = ['Strategy', 'Benchmark (VT)']
     st.line_chart(chart_data)
     
     st.subheader("📉 回撤圖 (Drawdown)")

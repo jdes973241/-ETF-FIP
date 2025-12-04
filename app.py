@@ -282,6 +282,7 @@ else:
     # --- Scoring & Ranking ---
     st.subheader("排名：綜合動能 (75%) + 品質 (25%)")
     
+    # 準備計算 Z-Score 的數據集
     metrics_df = pd.DataFrame(index=survivors)
     for ticker in survivors:
         try:
@@ -295,6 +296,7 @@ else:
             metrics_df.loc[ticker, 'FIP'] = fip
         except: continue
         
+    # 計算 Z-Score
     z_df = pd.DataFrame(index=survivors)
     mom_z_cols = []
     for p in periods:
@@ -305,16 +307,20 @@ else:
     z_df['Avg_Mom_Z'] = z_df[mom_z_cols].mean(axis=1)
     z_df['Z_FIP'] = zscore(metrics_df['FIP'], ddof=1, nan_policy='omit')
     
+    # 計算分數與貢獻
     z_df['Mom_Contrib (75%)'] = z_df['Avg_Mom_Z'] * 0.75
     z_df['FIP_Contrib (25%)'] = z_df['Z_FIP'] * 0.25
     z_df['Total_Score'] = z_df['Mom_Contrib (75%)'] + z_df['FIP_Contrib (25%)']
     
+    # 排序
     z_df = z_df.sort_values(by='Total_Score', ascending=False)
     top_3 = z_df.head(3).index.tolist()
     
+    # 合併原始數據
     metrics_df['Total_Score'] = z_df['Total_Score']
     metrics_df = metrics_df.loc[z_df.index]
 
+    # Tabs 切換
     tab_z, tab_raw = st.tabs(["📊 標準化數據 (Z-Score & 貢獻)", "🔢 原始數據 (報酬率 & FIP)"])
 
     with tab_z:
@@ -380,7 +386,7 @@ st.header("⏳ 歷史回測分析 (Backtest)")
 st.caption("回測設定：使用 DFEVX (長歷史版本)、無 DEHP。基準為 VT。")
 
 if st.button("🚀 開始執行回測 (Run Backtest)"):
-    # 1. 準備回測數據
+    # 1. 確定回測起始點 (需所有回測標的都有數據)
     check_tickers = backtest_tickers + safe_pool + ['VT']
     valid_starts = prices[check_tickers].apply(lambda x: x.first_valid_index())
     latest_start = valid_starts.max()
@@ -400,7 +406,7 @@ if st.button("🚀 開始執行回測 (Run Backtest)"):
     progress_bar = st.progress(0)
     total_steps = len(dates) - 1 - start_idx
     
-    # 回測用 Map (補齊 Benchmark 對應)
+    # 為 Alpha Filter 建立一個 backtest 專用的 assets map
     bt_assets_map = {t: live_assets_map.get(t, 'VTI') for t in backtest_tickers}
     bt_assets_map['DFEVX'] = 'EEM' 
 
@@ -521,33 +527,31 @@ if st.button("🚀 開始執行回測 (Run Backtest)"):
     bench_equity = (1 + bench_ret).cumprod()
     bench_dd = bench_equity / bench_equity.cummax() - 1
     
-    bench_cagr = (bench_equity.iloc[-1]) ** (12 / len(res_df)) - 1
-    bench_mdd = bench_dd.min()
-    
+    # Stats Calculation
+    years = len(res_df) / 12
     rf_rate = 0.0
-    bench_sharpe = (bench_ret.mean() * 12 - rf_rate) / (bench_ret.std() * np.sqrt(12))
     
+    # Benchmark Metrics
+    bench_cagr = (bench_equity.iloc[-1]) ** (1/years) - 1
+    bench_mdd = bench_dd.min()
     bench_neg = bench_ret[bench_ret < 0]
     bench_down_std = bench_neg.std() * np.sqrt(12) if len(bench_neg) > 0 else 1e-6
     bench_sortino = (bench_ret.mean() * 12 - rf_rate) / bench_down_std
-    
+    bench_sharpe = (bench_ret.mean() * 12 - rf_rate) / (bench_ret.std() * np.sqrt(12))
     bench_roll5y = bench_equity.rolling(60).apply(lambda x: (x.iloc[-1]/x.iloc[0])**(1/5) - 1).mean()
 
-    # Strategy Stats
-    years = len(res_df) / 12
+    # Strategy Metrics
+    total_ret = res_df['Equity'].iloc[-1] - 1
     cagr = (res_df['Equity'].iloc[-1]) ** (1/years) - 1
     mdd = res_df['DD'].min()
-    
     strat_ret_series = res_df['Strategy']
     sharpe = (strat_ret_series.mean() * 12 - rf_rate) / (strat_ret_series.std() * np.sqrt(12))
-    
     neg_rets = strat_ret_series[strat_ret_series < 0]
     down_std = neg_rets.std() * np.sqrt(12) if len(neg_rets) > 0 else 1e-6
     sortino = (strat_ret_series.mean() * 12 - rf_rate) / down_std
-    
     roll5y = res_df['Equity'].rolling(60).apply(lambda x: (x.iloc[-1]/x.iloc[0])**(1/5) - 1).mean()
     
-    # Helper to display metrics
+    # Display Helper
     def display_metric_pair(label, val_strat, val_bench, fmt="{:.2%}"):
         st.markdown(f"""
         <div style="margin-bottom: 10px;">
@@ -567,29 +571,32 @@ if st.button("🚀 開始執行回測 (Run Backtest)"):
     
     st.divider()
 
-    # 繪圖
+    # 顏色設定：Strategy (深藍), Benchmark (淺藍)
+    color_scheme = ['#03045E', '#00B4D8']
+
+    # 1. 權益曲線 (累積報酬率 %)
     st.subheader("📈 權益曲線 (Strategy vs VT)")
     chart_data = pd.DataFrame({
-        'Strategy': res_df['Equity'],
-        'Benchmark (VT)': bench_equity
+        'Strategy': (res_df['Equity'] - 1) * 100,
+        'Benchmark (VT)': (bench_equity - 1) * 100
     })
-    st.line_chart(chart_data)
+    st.line_chart(chart_data, color=color_scheme)
     
-    st.subheader("📉 回撤圖 (Drawdown Comparison)")
+    # 2. 回撤圖 (%)
+    st.subheader("📉 回撤圖 (Drawdown)")
     dd_data = pd.DataFrame({
-        'Strategy DD': res_df['DD'],
-        'Benchmark DD': bench_dd
+        'Strategy': res_df['DD'] * 100,
+        'Benchmark (VT)': bench_dd * 100
     })
-    # 使用 area chart 畫策略，line chart 畫 benchmark 可能比較清楚，但 streamlit area_chart 只能堆疊或並列
-    # 這裡直接用 line chart 比較清楚
-    st.line_chart(dd_data, color=['#ff4b4b', '#808080'])
+    st.line_chart(dd_data, color=color_scheme)
     
+    # 3. 滾動 5 年報酬 (%)
     st.subheader("🔄 滾動 5 年年化報酬 (Rolling 5-Year CAGR)")
     roll_strat = res_df['Equity'].rolling(60).apply(lambda x: (x.iloc[-1]/x.iloc[0])**(1/5) - 1)
     roll_bench = bench_equity.rolling(60).apply(lambda x: (x.iloc[-1]/x.iloc[0])**(1/5) - 1)
     
     roll_data = pd.DataFrame({
-        'Strategy 5Y': roll_strat,
-        'Benchmark 5Y': roll_bench
+        'Strategy': roll_strat * 100,
+        'Benchmark (VT)': roll_bench * 100
     })
-    st.line_chart(roll_data)
+    st.line_chart(roll_data, color=color_scheme)

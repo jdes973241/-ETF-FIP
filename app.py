@@ -5,6 +5,7 @@ import numpy as np
 import altair as alt
 from scipy.stats import zscore
 from datetime import datetime, timedelta
+import pytz
 
 # ==========================================
 # 頁面設定
@@ -37,66 +38,67 @@ def calculate_fip(daily_series, lookback=252):
     return (subset > 0).sum() / len(subset)
 
 @st.cache_data(ttl=3600)
-def load_and_process_data():
-    # 1. 定義資產池
-    # A. 即時監控用 (Live)
-    live_assets_map = {
-        'IMOM': 'EFA', 'IVAL': 'EFA', 'IDHQ': 'EFA', 'GWX': 'EFA',
-        'QMOM': 'VTI', 'QVAL': 'VTI', 'SPHQ': 'VTI', 'SCHA': 'VTI',
-        'PIE': 'EEM',  'DFEV': 'EEM', 'DEHP': 'EEM', 'EEMS': 'EEM'
-    }
+def fetch_market_data(all_symbols, start_date, end_date):
+    """
+    純 I/O 函數，負責數據下載。
+    已移除 datetime.now() 依賴，改由外部傳入固定日期字串以符合快取紀律。
+    """
+    # 雲端防禦編程：threads=False
+    data = yf.download(all_symbols, start=start_date, end=end_date, progress=False, auto_adjust=False, threads=False)
     
-    # B. 回測用 (Backtest): DFEV->DFEVX, 移除 DEHP
-    backtest_assets = [
-        'IMOM', 'IVAL', 'IDHQ', 'GWX',
-        'QMOM', 'QVAL', 'SPHQ', 'SCHA',
-        'PIE',  'DFEVX', 'EEMS' # 無 DEHP
-    ]
-    
-    # C. 避險與基準
-    safe_pool = ['TLT', 'GLD']
-    others = ['VT'] # Benchmark
-    
-    # 合併所有需要下載的代碼
-    all_symbols = list(set(list(live_assets_map.keys()) + list(live_assets_map.values()) + backtest_assets + safe_pool + others))
-
-    # 2. 下載數據 (抓取最長歷史以供回測)
-    start_date = '2000-01-01'
-    end_date = (datetime.now() + timedelta(days=1)).strftime('%Y-%m-%d')
-    
-    with st.spinner('正在下載所有歷史數據 (Live & Backtest)...'):
-        raw_data = yf.download(all_symbols, start=start_date, end=end_date, progress=False, auto_adjust=False)
-    
-    if 'Adj Close' in raw_data.columns:
-        prices = raw_data['Adj Close']
-    elif 'Close' in raw_data.columns:
-        prices = raw_data['Close']
+    # 數據結構標準化：處理 MultiIndex
+    if isinstance(data.columns, pd.MultiIndex):
+        if 'Adj Close' in data.columns.get_level_values(0):
+            prices = data['Adj Close']
+        elif 'Close' in data.columns.get_level_values(0):
+            prices = data['Close']
+        else:
+            return None, "❌ 嚴重錯誤: 資料中無 Close 或 Adj Close"
     else:
-        return None, None, None, None, None, None, None, None, None, "❌ 嚴重錯誤: 無法下載價格資料"
+        # 舊版或單一 ticker 可能回傳單層，做防呆
+        if 'Adj Close' in data.columns:
+            prices = data['Adj Close']
+        elif 'Close' in data.columns:
+            prices = data['Close']
+        else:
+            return None, "❌ 嚴重錯誤: 無法識別價格欄位"
+            
+    # 再次確認 Flattening (確保沒有 Ticker 作為 column name level)
+    prices.columns.name = None
+    return prices, None
 
+def process_data_logic(prices, live_assets_map, backtest_assets, safe_pool, current_datetime):
+    """
+    處理數據邏輯、填充空值、計算月報酬、判斷結算日。
+    不使用 cache，因為包含動態邏輯判斷。
+    """
     prices = prices.astype(float).ffill() # 填補空值
     
     if prices.empty:
-        return None, None, None, None, None, None, None, None, None, "❌ 錯誤: 下載的數據為空。"
+        return None, None, None, None, None, "❌ 錯誤: 下載的數據為空。"
 
     # 檢查數據新鮮度
     last_dt = prices.index[-1]
-    today = datetime.now()
-    if (today - last_dt).days > 7:
+    # 這裡的 current_datetime 是傳入的帶時區時間
+    if (current_datetime.replace(tzinfo=None) - last_dt.replace(tzinfo=None)).days > 7:
         st.warning(f"⚠️ 注意：最新數據日期為 {last_dt.strftime('%Y-%m-%d')}，可能非即時數據。")
 
     # 3. 智能月結算日期處理
     monthly_prices = prices.resample('ME').last()
     
-    current_date = datetime.now().date()
+    current_date_only = current_datetime.date()
     last_idx = monthly_prices.index[-1]
     
     # 檢查本月是否已結束
-    next_day = current_date + timedelta(days=1)
-    if last_idx.month == current_date.month and last_idx.year == current_date.year:
-         if next_day.month == current_date.month: 
+    # 邏輯：如果數據最後一個月等於當前月，且明天還在同一個月，代表本月還沒過完
+    next_day = current_date_only + timedelta(days=1)
+    
+    msg = ""
+    if last_idx.month == current_date_only.month and last_idx.year == current_date_only.year:
+         if next_day.month == current_date_only.month: 
              msg = f"⚠️ 本月 ({last_idx.strftime('%Y-%m')}) 尚未結束，使用上個月底數據進行分析。"
              monthly_prices = monthly_prices.iloc[:-1]
+             # 價格也截斷到上個月底，避免 look-ahead
              prices = prices.loc[:monthly_prices.index[-1]]
          else:
              msg = f"✅ 使用最新完整月份 ({last_idx.strftime('%Y-%m')}) 數據。"
@@ -107,18 +109,60 @@ def load_and_process_data():
     monthly_ret = monthly_prices.pct_change()
     daily_ret = prices.pct_change()
     
-    return prices, monthly_ret, daily_ret, monthly_prices, live_assets_map, backtest_assets, safe_pool, cutoff_date, msg
+    return prices, monthly_ret, daily_ret, monthly_prices, cutoff_date, msg
 
 # ==========================================
-# 執行計算與顯示
+# 數據準備與參數配置
 # ==========================================
-data_pack = load_and_process_data()
 
-if data_pack[0] is None:
-    st.error(data_pack[9])
+# 1. 定義資產池 (根據需求修改標的)
+# A. 即時監控用 (Live)
+# 修改：EEMS->EWX, SCHA->FDM, GWX->ISCF, DEHP->EQLT
+live_assets_map = {
+    'IMOM': 'EFA', 'IVAL': 'EFA', 'IDHQ': 'EFA', 'ISCF': 'EFA', # GWX -> ISCF
+    'QMOM': 'VTI', 'QVAL': 'VTI', 'SPHQ': 'VTI', 'FDM': 'VTI',  # SCHA -> FDM
+    'PIE': 'EEM',  'DFEV': 'EEM', 'EQLT': 'EEM', 'EWX': 'EEM'   # DEHP -> EQLT, EEMS -> EWX
+}
+
+# B. 回測用 (Backtest)
+# 修改：EEMS->EWX, SCHA->FDM, GWX->ISCF
+# 注意：EQLT 不納入回測 (因為歷史太短或指令要求)，維持 DFEVX
+backtest_assets = [
+    'IMOM', 'IVAL', 'IDHQ', 'ISCF', # GWX -> ISCF
+    'QMOM', 'QVAL', 'SPHQ', 'FDM',  # SCHA -> FDM
+    'PIE',  'DFEVX', 'EWX'          # EEMS -> EWX, 無 EQLT
+]
+
+# C. 避險與基準
+safe_pool = ['TLT', 'GLD']
+others = ['VT'] # Benchmark
+
+# 合併所有需要下載的代碼
+all_symbols = list(set(list(live_assets_map.keys()) + list(live_assets_map.values()) + backtest_assets + safe_pool + others))
+
+# 設定時間與時區 (Strict Check: 時區顯性化)
+tz = pytz.timezone('Asia/Taipei')
+now_tw = datetime.now(tz)
+start_date_str = '2000-01-01'
+end_date_str = (now_tw + timedelta(days=1)).strftime('%Y-%m-%d')
+
+# 執行下載 (Cache Layer)
+with st.spinner('正在下載所有歷史數據 (Live & Backtest)...'):
+    raw_prices, error_msg = fetch_market_data(all_symbols, start_date_str, end_date_str)
+
+if raw_prices is None:
+    st.error(error_msg)
     st.stop()
 
-prices, monthly_ret, daily_ret, monthly_prices, live_assets_map, backtest_tickers, safe_pool, cutoff_date, status_msg = data_pack
+# 執行邏輯處理 (Logic Layer - No Cache)
+prices, monthly_ret, daily_ret, monthly_prices, cutoff_date, status_msg = process_data_logic(
+    raw_prices, live_assets_map, backtest_assets, safe_pool, now_tw
+)
+
+if prices is None:
+    st.error(status_msg)
+    st.stop()
+
 equity_tickers = list(live_assets_map.keys())
 
 # --- 側邊欄：市場快照 ---
@@ -271,7 +315,7 @@ else:
         st.stop()
         
     # --- Scoring & Ranking ---
-    st.subheader("排名：綜合動能 (75%) + 品質 (25%)")
+    st.subheader("排名：綜合動能 (75%) + 品質 (FIP 25%)")
     
     metrics_df = pd.DataFrame(index=survivors)
     for ticker in survivors:
@@ -293,6 +337,10 @@ else:
         mom_z_cols.append(col_name)
     
     z_df['Avg_Mom_Z'] = z_df[mom_z_cols].mean(axis=1)
+    # FIP 越低越好，因此 Z-Score 取負號 (如果 FIP 本身是正向指標則不需要，但 FIP 是波動/回撤指標，越低越好？
+    # 原策略 FIP 定義：(subset > 0).sum() / len(subset)。這是「正報酬天數佔比」。
+    # 既然是「正報酬天數佔比」，則是「越高越好」。
+    # 因此 Z_FIP 不需要取負號。
     z_df['Z_FIP'] = zscore(metrics_df['FIP'], ddof=1, nan_policy='omit')
     
     z_df['Mom_Contrib (75%)'] = z_df['Avg_Mom_Z'] * 0.75
@@ -344,10 +392,11 @@ else:
 # ==========================================
 st.markdown("---")
 st.header("⏳ 歷史回測分析 (Backtest)")
-st.caption("回測設定：使用 DFEVX (長歷史版本)、無 DEHP。基準為 VT。")
+# 修改：更新文字描述
+st.caption("回測設定：使用 DFEVX (長歷史版本)、無 EQLT。基準為 VT。")
 
 if st.button("🚀 開始執行回測 (Run Backtest)"):
-    check_tickers = backtest_tickers + safe_pool + ['VT']
+    check_tickers = backtest_assets + safe_pool + ['VT']
     valid_starts = prices[check_tickers].apply(lambda x: x.first_valid_index())
     latest_start = valid_starts.max()
     warmup_days = 365 + 30
@@ -366,7 +415,8 @@ if st.button("🚀 開始執行回測 (Run Backtest)"):
     progress_bar = st.progress(0)
     total_steps = len(dates) - 1 - start_idx
     
-    bt_assets_map = {t: live_assets_map.get(t, 'VTI') for t in backtest_tickers}
+    bt_assets_map = {t: live_assets_map.get(t, 'VTI') for t in backtest_assets}
+    # DFEVX 對應 EEM
     bt_assets_map['DFEVX'] = 'EEM' 
 
     for i in range(start_idx, len(dates) - 1):
@@ -380,7 +430,7 @@ if st.button("🚀 開始執行回測 (Run Backtest)"):
         hist_monthly_ret = monthly_ret.loc[:curr_date]
         
         neg_count = 0
-        for t in backtest_tickers:
+        for t in backtest_assets:
             try:
                 p_now = hist_monthly.iloc[-1][t]
                 avg_mom = 0
@@ -407,7 +457,7 @@ if st.button("🚀 開始執行回測 (Run Backtest)"):
             selected_tickers = [best_hedge]
         else:
             survivors = []
-            for t in backtest_tickers:
+            for t in backtest_assets:
                 bench = bt_assets_map.get(t, 'VTI')
                 try:
                     subset = hist_daily[[t, bench]].tail(252).dropna()

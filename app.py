@@ -37,32 +37,33 @@ def calculate_fip(daily_series, lookback=252):
     if len(subset) < lookback * 0.5: return 0.0
     return (subset > 0).sum() / len(subset)
 
-def calculate_sortino(daily_series, lookback_months, target_return=0):
+def calculate_sortino_details(daily_series, lookback_months, target_return=0):
     """
-    [修正版] 計算符合學術定義的 Sortino Ratio (LPM Method)
+    [詳細版] 計算 Sortino Ratio 並回傳中間過程數據 (分子、分母)
     Lookback 轉換: 1個月 約為 21 個交易日
     """
     days = int(lookback_months * 21)
     subset = daily_series.tail(days).dropna()
     
-    if len(subset) < days * 0.5: return -999.0 # 資料不足
+    if len(subset) < days * 0.5: return -999.0, 0.0, 0.0 # 資料不足
     
-    # 1. 平均日報酬 (年化分子) - 使用算術平均 (Arithmetic Mean)
+    # 1. 分子：年化算術平均報酬 (Annualized Return)
     avg_ret = subset.mean() * 252 
     
-    # 2. 下行偏差 (Downside Deviation) - 學術標準公式
+    # 2. 分母：下行偏差 (Downside Deviation - LPM Method)
     # 定義：低於 Target (0) 的報酬平方和，除以"總天數"，開根號
     excess_return = subset - target_return
     downside_return = np.where(excess_return < 0, excess_return, 0)
     
     # 注意：分母除以 n (總樣本數)，而非負報酬樣本數，以正確反映下跌頻率風險
-    downside_std = np.sqrt(np.mean(downside_return**2)) * np.sqrt(252)
+    downside_variance = np.mean(downside_return**2)
+    downside_std = np.sqrt(downside_variance) * np.sqrt(252)
     
     if downside_std == 0:
-        # 極端情況：完全沒有下跌。給予一個極高的上限值，代表"完美動能"
-        return 10.0 
+        return 10.0, avg_ret, 0.0
         
-    return avg_ret / downside_std
+    sortino = avg_ret / downside_std
+    return sortino, avg_ret, downside_std
 
 @st.cache_data(ttl=3600)
 def fetch_market_data(all_symbols, start_date, end_date):
@@ -126,25 +127,25 @@ def process_data_logic(prices, live_assets_map, backtest_assets, safe_pool, curr
 # ==========================================
 
 # 1. Live 資產池 (即時監控)
-# 修改：將 DFEVX (共同基金) 改為 DFEV (ETF)，以獲得更即時報價
+# 修改：使用 DFEV (ETF) 以取得即時報價，並加入 EQLT
 live_assets_map = {
     'IMOM': 'EFA', 'IVAL': 'EFA', 'IDHQ': 'EFA', 'ISCF': 'EFA', 
     'QMOM': 'VTI', 'QVAL': 'VTI', 'SPHQ': 'VTI', 'FDM': 'VTI',  
-    'PIE': 'EEM',  'DFEV': 'EEM', 'EWX': 'EEM', 'EQLT': 'EEM'  # DFEVX -> DFEV
+    'PIE': 'EEM',  'DFEV': 'EEM', 'EWX': 'EEM', 'EQLT': 'EEM' 
 }
 
 # 2. Backtest 資產池 (歷史回測)
-# 修改：維持使用 DFEVX，因為歷史數據較長
+# 修改：維持使用 DFEVX (歷史長)，不含 EQLT (歷史短)
 backtest_assets = [
     'IMOM', 'IVAL', 'IDHQ', 'ISCF', 
     'QMOM', 'QVAL', 'SPHQ', 'FDM',  
-    'PIE',  'DFEVX', 'EWX'          # 維持 DFEVX
+    'PIE',  'DFEVX', 'EWX'          
 ]
 
 safe_pool = ['TLT', 'GLD']
 others = ['VT'] 
 
-# 合併所有需要下載的代碼 (會自動去重，同時下載 DFEV 和 DFEVX)
+# 合併所有需要下載的代碼
 all_symbols = list(set(list(live_assets_map.keys()) + list(live_assets_map.values()) + backtest_assets + safe_pool + others))
 
 tz = pytz.timezone('Asia/Taipei')
@@ -316,39 +317,51 @@ else:
         
     # --- Scoring & Ranking (Raw Sortino * FIP) ---
     st.subheader("排名：Raw Sortino (3M+12M) X FIP")
+    st.caption("Sortino = Annualized Mean Return / Downside Deviation (LPM Method)")
     
     metrics_list = []
     selection_lookbacks = [3, 12]
 
     for ticker in survivors:
         try:
-            # 1. 分別計算 3M 與 12M 的 Sortino
-            s_3m = calculate_sortino(daily_ret[ticker], 3)
-            s_12m = calculate_sortino(daily_ret[ticker], 12)
+            # 取得最新收盤價
+            price = monthly_prices.loc[cutoff_date, ticker]
+            
+            # 1. 計算原始回報 (Raw Return) - 用於顯示
+            # 3M Return
+            p_3m = monthly_prices.iloc[-4][ticker]
+            raw_ret_3m = (price / p_3m) - 1
+            # 12M Return
+            p_12m = monthly_prices.iloc[-13][ticker]
+            raw_ret_12m = (price / p_12m) - 1
+            
+            # 2. 計算 Sortino 及其組成 (過程)
+            s_3m, ann_ret_3m, downside_3m = calculate_sortino_details(daily_ret[ticker], 3)
+            s_12m, ann_ret_12m, downside_12m = calculate_sortino_details(daily_ret[ticker], 12)
             
             # 平均 Sortino
             avg_sortino = (s_3m + s_12m) / 2
             
-            # 2. 計算 FIP
+            # 3. 計算 FIP
             fip = calculate_fip(daily_ret[ticker])
             
-            # 3. 乘法評分
+            # 4. 乘法評分
             score = avg_sortino * fip
-            
-            # 4. 計算原始報酬 (僅供顯示驗算，不參與排名)
-            p_now = monthly_prices.loc[cutoff_date, ticker]
-            r_3m = (p_now / monthly_prices.iloc[-4][ticker]) - 1
-            r_12m = (p_now / monthly_prices.iloc[-13][ticker]) - 1
-            avg_raw_ret = (r_3m + r_12m) / 2
             
             metrics_list.append({
                 'Ticker': ticker,
                 'Total_Score': score,
-                'Avg_Sortino': avg_sortino,
+                'Price': price,
+                'Raw_Ret_3M': raw_ret_3m,
+                'Raw_Ret_12M': raw_ret_12m,
                 'Sortino_3M': s_3m,
+                'Numerator_3M (Ann_Ret)': ann_ret_3m,
+                'Denominator_3M (Downside)': downside_3m,
                 'Sortino_12M': s_12m,
-                'FIP': fip,
-                'Avg_Raw_Return': avg_raw_ret
+                'Numerator_12M (Ann_Ret)': ann_ret_12m,
+                'Denominator_12M (Downside)': downside_12m,
+                'Avg_Sortino': avg_sortino,
+                'FIP': fip
             })
         except: continue
     
@@ -360,10 +373,22 @@ else:
     top_N = 2
     top_tickers = rank_df.head(top_N).index.tolist()
     
-    # 顯示詳細數據表格 (方便驗算)
+    # 顯示詳細數據表格 (含中間過程)
     st.dataframe(
-        rank_df.style.format("{:.4f}")
-        .background_gradient(subset=['Total_Score'], cmap='Greens'),
+        rank_df.style.format({
+            'Total_Score': '{:.4f}',
+            'Price': '{:.2f}',
+            'Raw_Ret_3M': '{:.2%}',
+            'Raw_Ret_12M': '{:.2%}',
+            'Sortino_3M': '{:.2f}',
+            'Numerator_3M (Ann_Ret)': '{:.2%}',
+            'Denominator_3M (Downside)': '{:.2%}',
+            'Sortino_12M': '{:.2f}',
+            'Numerator_12M (Ann_Ret)': '{:.2%}',
+            'Denominator_12M (Downside)': '{:.2%}',
+            'Avg_Sortino': '{:.2f}',
+            'FIP': '{:.2f}'
+        }).background_gradient(subset=['Total_Score'], cmap='Greens'),
         use_container_width=True
     )
     
@@ -395,7 +420,7 @@ else:
 # ==========================================
 st.markdown("---")
 st.header("⏳ 歷史回測分析 (Backtest)")
-st.caption("回測設定：不包含 EQLT (維持11檔)。基準為 VT。選股邏輯：Raw Sortino(3+12) * FIP, Top 2。")
+st.caption("回測設定：使用 DFEVX (長歷史)，不含 EQLT。基準為 VT。選股邏輯：Raw Sortino(3+12) * FIP, Top 2。")
 
 if st.button("🚀 開始執行回測 (Run Backtest)"):
     check_tickers = backtest_assets + safe_pool + ['VT']
@@ -417,7 +442,6 @@ if st.button("🚀 開始執行回測 (Run Backtest)"):
     progress_bar = st.progress(0)
     total_steps = len(dates) - 1 - start_idx
     
-    # 建立回測用的 Benchmark 對照表 (DFEVX 對應 EEM)
     bt_assets_map = {t: live_assets_map.get(t, 'VTI') for t in backtest_assets}
     bt_assets_map['DFEVX'] = 'EEM' 
 
@@ -491,9 +515,11 @@ if st.button("🚀 開始執行回測 (Run Backtest)"):
                 sel_lookbacks = [3, 12]
                 for t in survivors:
                     try:
+                        # 計算平均 Sortino (直接計算，不需過程)
                         avg_s = 0
                         for p in sel_lookbacks:
-                            avg_s += calculate_sortino(hist_daily[t], p)
+                            s, _, _ = calculate_sortino_details(hist_daily[t], p)
+                            avg_s += s
                         avg_s /= len(sel_lookbacks)
                         
                         fip_val = calculate_fip(hist_daily[t])

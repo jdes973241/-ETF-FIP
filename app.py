@@ -39,7 +39,7 @@ def calculate_fip(daily_series, lookback=252):
 
 def calculate_sortino(daily_series, lookback_months):
     """
-    [新增函數] 計算原始 Sortino Ratio
+    計算原始 Sortino Ratio
     Lookback 轉換: 1個月 約為 21 個交易日
     """
     days = int(lookback_months * 21)
@@ -124,12 +124,14 @@ def process_data_logic(prices, live_assets_map, backtest_assets, safe_pool, curr
 # 數據準備與參數配置
 # ==========================================
 
+# 1. Live 資產池 (新增 EQLT)
 live_assets_map = {
     'IMOM': 'EFA', 'IVAL': 'EFA', 'IDHQ': 'EFA', 'ISCF': 'EFA', 
     'QMOM': 'VTI', 'QVAL': 'VTI', 'SPHQ': 'VTI', 'FDM': 'VTI',  
-    'PIE': 'EEM',  'DFEVX': 'EEM', 'EWX': 'EEM'  # DFEVX
+    'PIE': 'EEM',  'DFEVX': 'EEM', 'EWX': 'EEM', 'EQLT': 'EEM'  # 新增 EQLT
 }
 
+# 2. Backtest 資產池 (維持 11 檔，不含 EQLT)
 backtest_assets = [
     'IMOM', 'IVAL', 'IDHQ', 'ISCF', 
     'QMOM', 'QVAL', 'SPHQ', 'FDM',  
@@ -180,7 +182,6 @@ with st.sidebar:
 # ==========================================
 st.subheader("1️⃣ 第一階段：市場狀態判斷 (Regime Filter)")
 
-# 避險邏輯的回顧期，維持不變 [3, 6, 9, 12]
 hedge_periods = [3, 6, 9, 12]
 regime_stats = []
 neg_count = 0 
@@ -238,7 +239,7 @@ st.divider()
 # ==========================================
 
 if not is_bull_market:
-    # 🐻 避險模式 (維持不變)
+    # 🐻 避險模式
     st.header("2️⃣ 第二階段 (A)：避險模式 (Risk-Off)")
     st.info("全市場動能 < 0，啟動避險。比較 TLT 與 GLD 的 12 個月報酬率。")
     
@@ -266,10 +267,10 @@ if not is_bull_market:
     st.success(f"🛡️ 本月建議持倉: **{best_hedge}** (100% 權重)")
 
 else:
-    # 🐂 進攻模式 (修改：使用 Raw Sortino [3+12] * FIP)
+    # 🐂 進攻模式
     st.header("2️⃣ 第二階段 (B)：進攻模式 (Risk-On)")
     
-    # --- Alpha Filter (維持不變) ---
+    # --- Alpha Filter ---
     st.subheader("篩選：Alpha 濾網")
     st.caption("條件：(1M Alpha > 0) OR (12M Alpha > 0)")
     
@@ -309,19 +310,20 @@ else:
         st.error("⚠️ 沒有標的通過 Alpha 濾網。建議轉為持有備用資產 (VT) 或現金。")
         st.stop()
         
-    # --- Scoring & Ranking (修改核心：Raw Sortino * FIP) ---
+    # --- Scoring & Ranking (Raw Sortino * FIP) ---
     st.subheader("排名：Raw Sortino (3M+12M) X FIP")
     
     metrics_list = []
-    selection_lookbacks = [3, 12] # 指定回顧期
+    selection_lookbacks = [3, 12]
 
     for ticker in survivors:
         try:
-            # 1. 計算 Raw Sortino (3M 與 12M 的平均)
-            avg_sortino = 0
-            for p in selection_lookbacks:
-                avg_sortino += calculate_sortino(daily_ret[ticker], p)
-            avg_sortino /= len(selection_lookbacks)
+            # 1. 分別計算 3M 與 12M 的 Sortino
+            s_3m = calculate_sortino(daily_ret[ticker], 3)
+            s_12m = calculate_sortino(daily_ret[ticker], 12)
+            
+            # 平均 Sortino
+            avg_sortino = (s_3m + s_12m) / 2
             
             # 2. 計算 FIP
             fip = calculate_fip(daily_ret[ticker])
@@ -333,6 +335,8 @@ else:
                 'Ticker': ticker,
                 'Total_Score': score,
                 'Avg_Sortino': avg_sortino,
+                'Sortino_3M': s_3m,
+                'Sortino_12M': s_12m,
                 'FIP': fip
             })
         except: continue
@@ -345,7 +349,12 @@ else:
     top_N = 2
     top_tickers = rank_df.head(top_N).index.tolist()
     
-    st.dataframe(rank_df.style.format("{:.4f}"), use_container_width=True)
+    # 顯示詳細數據表格 (方便驗算)
+    st.dataframe(
+        rank_df.style.format("{:.4f}")
+        .background_gradient(subset=['Total_Score'], cmap='Greens'),
+        use_container_width=True
+    )
     
     # --- 2.3 資金配置 (Allocation) ---
     st.subheader(f"🏆 最終資金配置 (Top {top_N} 等權重)")
@@ -375,7 +384,7 @@ else:
 # ==========================================
 st.markdown("---")
 st.header("⏳ 歷史回測分析 (Backtest)")
-st.caption("回測設定：DFEVX, 無 EQLT。基準為 VT。選股邏輯：Raw Sortino(3+12) * FIP, Top 2。")
+st.caption("回測設定：不包含 EQLT (維持11檔)。基準為 VT。選股邏輯：Raw Sortino(3+12) * FIP, Top 2。")
 
 if st.button("🚀 開始執行回測 (Run Backtest)"):
     check_tickers = backtest_assets + safe_pool + ['VT']
@@ -438,9 +447,9 @@ if st.button("🚀 開始執行回測 (Run Backtest)"):
                 except: pass
             selected_tickers = [best_hedge]
         else:
-            # 2. 進攻選股 (修改：Sortino * FIP)
+            # 2. 進攻選股
             survivors = []
-            # Alpha Filter (不變)
+            # Alpha Filter
             for t in backtest_assets:
                 bench = bt_assets_map.get(t, 'VTI')
                 try:
@@ -467,19 +476,15 @@ if st.button("🚀 開始執行回測 (Run Backtest)"):
                 selected_tickers = ['VT']
             else:
                 metrics = []
-                sel_lookbacks = [3, 12] # 指定回顧期
+                sel_lookbacks = [3, 12]
                 for t in survivors:
                     try:
-                        # Raw Sortino Average
                         avg_s = 0
                         for p in sel_lookbacks:
                             avg_s += calculate_sortino(hist_daily[t], p)
                         avg_s /= len(sel_lookbacks)
                         
-                        # FIP
                         fip_val = calculate_fip(hist_daily[t])
-                        
-                        # Score
                         score = avg_s * fip_val
                         
                         metrics.append({'ticker': t, 'Score': score})
@@ -487,7 +492,6 @@ if st.button("🚀 開始執行回測 (Run Backtest)"):
                 
                 if metrics:
                     m_df = pd.DataFrame(metrics).set_index('ticker')
-                    # 取 Top 2
                     selected_tickers = m_df.sort_values('Score', ascending=False).head(2).index.tolist()
                 else:
                     selected_tickers = ['VT']

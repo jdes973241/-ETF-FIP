@@ -13,13 +13,13 @@ import pytz
 st.set_page_config(page_title="多重資產動能策略", layout="wide")
 st.title("🛡️ 多重資產因子動能輪動策略 (Live & Backtest)")
 st.markdown("""
-**策略邏輯摘要：**
-1.  **市場狀態 (Regime)**：計算 12 檔股票因子的平均動能。若 **>= 6 檔** 動能轉負，則全面避險；否則進攻。
+**策略邏輯摘要 (Sortino Optimized)：**
+1.  **市場狀態 (Regime)**：計算 12 檔股票因子的平均動能 (3,6,9,12M)。若 **>= 6 檔** 動能轉負，則全面避險。
 2.  **避險模式 (Risk-Off)**：比較 **TLT** 與 **GLD** 的 12 個月報酬，全倉持有強者。
 3.  **進攻模式 (Risk-On)**：
     * **濾網**：Alpha (1M 或 12M > 0)。
-    * **排名**：動能 (3+6+9+12M) 75% + 品質 (FIP) 25%。
-    * **配置**：持有前 3 名，等權重。
+    * **評分**：**Raw Sortino (3M+12M) $\\times$ FIP**。
+    * **配置**：持有 **前 2 名**，等權重。
 """)
 
 # ==========================================
@@ -34,19 +34,41 @@ def calculate_daily_beta(asset, bench, daily_df, lookback=252):
 def calculate_fip(daily_series, lookback=252):
     """計算 FIP: 過去 lookback 天數中，正報酬天數的佔比"""
     subset = daily_series.tail(lookback).dropna()
-    if len(subset) < lookback * 0.5: return np.nan
+    if len(subset) < lookback * 0.5: return 0.0
     return (subset > 0).sum() / len(subset)
+
+def calculate_sortino(daily_series, lookback_months):
+    """
+    [新增函數] 計算原始 Sortino Ratio
+    Lookback 轉換: 1個月 約為 21 個交易日
+    """
+    days = int(lookback_months * 21)
+    subset = daily_series.tail(days).dropna()
+    
+    if len(subset) < days * 0.5: return -999.0 # 資料不足
+    
+    # 1. 平均日報酬 (年化分子)
+    avg_ret = subset.mean() * 252 
+    
+    # 2. 下行標準差 (年化分母)
+    downside_returns = subset[subset < 0]
+    
+    if len(downside_returns) == 0:
+        return 10.0 # 無下行風險，給予高分
+        
+    downside_std = downside_returns.std() * np.sqrt(252)
+    
+    if downside_std == 0:
+        return 10.0
+        
+    return avg_ret / downside_std
 
 @st.cache_data(ttl=3600)
 def fetch_market_data(all_symbols, start_date, end_date):
-    """
-    純 I/O 函數，負責數據下載。
-    已移除 datetime.now() 依賴，改由外部傳入固定日期字串以符合快取紀律。
-    """
-    # 雲端防禦編程：threads=False
+    """純 I/O 函數，負責數據下載 (Threads=False)"""
     data = yf.download(all_symbols, start=start_date, end=end_date, progress=False, auto_adjust=False, threads=False)
     
-    # 數據結構標準化：處理 MultiIndex
+    # 數據結構標準化
     if isinstance(data.columns, pd.MultiIndex):
         if 'Adj Close' in data.columns.get_level_values(0):
             prices = data['Adj Close']
@@ -55,7 +77,6 @@ def fetch_market_data(all_symbols, start_date, end_date):
         else:
             return None, "❌ 嚴重錯誤: 資料中無 Close 或 Adj Close"
     else:
-        # 舊版或單一 ticker 可能回傳單層，做防呆
         if 'Adj Close' in data.columns:
             prices = data['Adj Close']
         elif 'Close' in data.columns:
@@ -63,34 +84,23 @@ def fetch_market_data(all_symbols, start_date, end_date):
         else:
             return None, "❌ 嚴重錯誤: 無法識別價格欄位"
             
-    # 再次確認 Flattening (確保沒有 Ticker 作為 column name level)
     prices.columns.name = None
     return prices, None
 
 def process_data_logic(prices, live_assets_map, backtest_assets, safe_pool, current_datetime):
-    """
-    處理數據邏輯、填充空值、計算月報酬、判斷結算日。
-    不使用 cache，因為包含動態邏輯判斷。
-    """
-    prices = prices.astype(float).ffill() # 填補空值
+    prices = prices.astype(float).ffill() 
     
     if prices.empty:
         return None, None, None, None, None, "❌ 錯誤: 下載的數據為空。"
 
-    # 檢查數據新鮮度
     last_dt = prices.index[-1]
-    # 這裡的 current_datetime 是傳入的帶時區時間
     if (current_datetime.replace(tzinfo=None) - last_dt.replace(tzinfo=None)).days > 7:
         st.warning(f"⚠️ 注意：最新數據日期為 {last_dt.strftime('%Y-%m-%d')}，可能非即時數據。")
 
-    # 3. 智能月結算日期處理
     monthly_prices = prices.resample('ME').last()
     
     current_date_only = current_datetime.date()
     last_idx = monthly_prices.index[-1]
-    
-    # 檢查本月是否已結束
-    # 邏輯：如果數據最後一個月等於當前月，且明天還在同一個月，代表本月還沒過完
     next_day = current_date_only + timedelta(days=1)
     
     msg = ""
@@ -98,7 +108,6 @@ def process_data_logic(prices, live_assets_map, backtest_assets, safe_pool, curr
          if next_day.month == current_date_only.month: 
              msg = f"⚠️ 本月 ({last_idx.strftime('%Y-%m')}) 尚未結束，使用上個月底數據進行分析。"
              monthly_prices = monthly_prices.iloc[:-1]
-             # 價格也截斷到上個月底，避免 look-ahead
              prices = prices.loc[:monthly_prices.index[-1]]
          else:
              msg = f"✅ 使用最新完整月份 ({last_idx.strftime('%Y-%m')}) 數據。"
@@ -115,38 +124,28 @@ def process_data_logic(prices, live_assets_map, backtest_assets, safe_pool, curr
 # 數據準備與參數配置
 # ==========================================
 
-# 1. 定義資產池 (根據需求修改標的)
-# A. 即時監控用 (Live)
-# 修改：EEMS->EWX, SCHA->FDM, GWX->ISCF, DEHP->EQLT
 live_assets_map = {
-    'IMOM': 'EFA', 'IVAL': 'EFA', 'IDHQ': 'EFA', 'ISCF': 'EFA', # GWX -> ISCF
-    'QMOM': 'VTI', 'QVAL': 'VTI', 'SPHQ': 'VTI', 'FDM': 'VTI',  # SCHA -> FDM
-    'PIE': 'EEM',  'DFEV': 'EEM', 'EQLT': 'EEM', 'EWX': 'EEM'   # DEHP -> EQLT, EEMS -> EWX
+    'IMOM': 'EFA', 'IVAL': 'EFA', 'IDHQ': 'EFA', 'ISCF': 'EFA', 
+    'QMOM': 'VTI', 'QVAL': 'VTI', 'SPHQ': 'VTI', 'FDM': 'VTI',  
+    'PIE': 'EEM',  'DFEVX': 'EEM', 'EWX': 'EEM'  # DFEVX
 }
 
-# B. 回測用 (Backtest)
-# 修改：EEMS->EWX, SCHA->FDM, GWX->ISCF
-# 注意：EQLT 不納入回測 (因為歷史太短或指令要求)，維持 DFEVX
 backtest_assets = [
-    'IMOM', 'IVAL', 'IDHQ', 'ISCF', # GWX -> ISCF
-    'QMOM', 'QVAL', 'SPHQ', 'FDM',  # SCHA -> FDM
-    'PIE',  'DFEVX', 'EWX'          # EEMS -> EWX, 無 EQLT
+    'IMOM', 'IVAL', 'IDHQ', 'ISCF', 
+    'QMOM', 'QVAL', 'SPHQ', 'FDM',  
+    'PIE',  'DFEVX', 'EWX'          
 ]
 
-# C. 避險與基準
 safe_pool = ['TLT', 'GLD']
-others = ['VT'] # Benchmark
+others = ['VT'] 
 
-# 合併所有需要下載的代碼
 all_symbols = list(set(list(live_assets_map.keys()) + list(live_assets_map.values()) + backtest_assets + safe_pool + others))
 
-# 設定時間與時區 (Strict Check: 時區顯性化)
 tz = pytz.timezone('Asia/Taipei')
 now_tw = datetime.now(tz)
 start_date_str = '2000-01-01'
 end_date_str = (now_tw + timedelta(days=1)).strftime('%Y-%m-%d')
 
-# 執行下載 (Cache Layer)
 with st.spinner('正在下載所有歷史數據 (Live & Backtest)...'):
     raw_prices, error_msg = fetch_market_data(all_symbols, start_date_str, end_date_str)
 
@@ -154,7 +153,6 @@ if raw_prices is None:
     st.error(error_msg)
     st.stop()
 
-# 執行邏輯處理 (Logic Layer - No Cache)
 prices, monthly_ret, daily_ret, monthly_prices, cutoff_date, status_msg = process_data_logic(
     raw_prices, live_assets_map, backtest_assets, safe_pool, now_tw
 )
@@ -165,12 +163,10 @@ if prices is None:
 
 equity_tickers = list(live_assets_map.keys())
 
-# --- 側邊欄：市場快照 ---
 with st.sidebar:
     st.header("📈 市場快照")
     st.info(f"分析基準日: {cutoff_date.strftime('%Y-%m-%d')}")
     st.caption(status_msg)
-    
     try:
         vti_p = monthly_prices.loc[cutoff_date, 'VTI']
         tlt_p = monthly_prices.loc[cutoff_date, 'TLT']
@@ -180,11 +176,12 @@ with st.sidebar:
     st.divider()
 
 # ==========================================
-# 第一階段：市場狀態判斷 (Count-Based Regime)
+# 第一階段：市場狀態判斷 (維持不變)
 # ==========================================
 st.subheader("1️⃣ 第一階段：市場狀態判斷 (Regime Filter)")
 
-periods = [3, 6, 9, 12]
+# 避險邏輯的回顧期，維持不變 [3, 6, 9, 12]
+hedge_periods = [3, 6, 9, 12]
 regime_stats = []
 neg_count = 0 
 valid_count = 0
@@ -195,7 +192,7 @@ for ticker in equity_tickers:
         ticker_avg_mom = 0
         p_vals = []
         
-        for p in periods:
+        for p in hedge_periods:
             p_prev = monthly_prices.iloc[-1-p][ticker] 
             r = (p_now / p_prev) - 1
             ticker_avg_mom += r
@@ -203,7 +200,6 @@ for ticker in equity_tickers:
             
         ticker_avg_mom /= 4
         
-        # 判斷正負
         status_icon = "🟢" if ticker_avg_mom > 0 else "🔴"
         if ticker_avg_mom < 0:
             neg_count += 1
@@ -220,7 +216,6 @@ for ticker in equity_tickers:
     except Exception as e:
         continue
 
-# 判斷邏輯：若負動能數量 >= 6，則為熊市
 THRESHOLD_N = 6
 is_bull_market = neg_count < THRESHOLD_N
 
@@ -243,7 +238,7 @@ st.divider()
 # ==========================================
 
 if not is_bull_market:
-    # 🐻 避險模式
+    # 🐻 避險模式 (維持不變)
     st.header("2️⃣ 第二階段 (A)：避險模式 (Risk-Off)")
     st.info("全市場動能 < 0，啟動避險。比較 TLT 與 GLD 的 12 個月報酬率。")
     
@@ -271,10 +266,10 @@ if not is_bull_market:
     st.success(f"🛡️ 本月建議持倉: **{best_hedge}** (100% 權重)")
 
 else:
-    # 🐂 進攻模式
+    # 🐂 進攻模式 (修改：使用 Raw Sortino [3+12] * FIP)
     st.header("2️⃣ 第二階段 (B)：進攻模式 (Risk-On)")
     
-    # --- Alpha Filter ---
+    # --- Alpha Filter (維持不變) ---
     st.subheader("篩選：Alpha 濾網")
     st.caption("條件：(1M Alpha > 0) OR (12M Alpha > 0)")
     
@@ -314,86 +309,73 @@ else:
         st.error("⚠️ 沒有標的通過 Alpha 濾網。建議轉為持有備用資產 (VT) 或現金。")
         st.stop()
         
-    # --- Scoring & Ranking ---
-    st.subheader("排名：綜合動能 (75%) + 品質 (FIP 25%)")
+    # --- Scoring & Ranking (修改核心：Raw Sortino * FIP) ---
+    st.subheader("排名：Raw Sortino (3M+12M) X FIP")
     
-    metrics_df = pd.DataFrame(index=survivors)
+    metrics_list = []
+    selection_lookbacks = [3, 12] # 指定回顧期
+
     for ticker in survivors:
         try:
-            p_now = monthly_prices.loc[cutoff_date, ticker]
-            for p in periods:
-                p_prev = monthly_prices.iloc[-1-p][ticker]
-                r = (p_now / p_prev) - 1
-                metrics_df.loc[ticker, f'R_{p}M'] = r
+            # 1. 計算 Raw Sortino (3M 與 12M 的平均)
+            avg_sortino = 0
+            for p in selection_lookbacks:
+                avg_sortino += calculate_sortino(daily_ret[ticker], p)
+            avg_sortino /= len(selection_lookbacks)
+            
+            # 2. 計算 FIP
             fip = calculate_fip(daily_ret[ticker])
-            metrics_df.loc[ticker, 'FIP'] = fip
+            
+            # 3. 乘法評分
+            score = avg_sortino * fip
+            
+            metrics_list.append({
+                'Ticker': ticker,
+                'Total_Score': score,
+                'Avg_Sortino': avg_sortino,
+                'FIP': fip
+            })
         except: continue
-        
-    z_df = pd.DataFrame(index=survivors)
-    mom_z_cols = []
-    for p in periods:
-        col_name = f'Z_{p}M'
-        z_df[col_name] = zscore(metrics_df[f'R_{p}M'], ddof=1, nan_policy='omit')
-        mom_z_cols.append(col_name)
     
-    z_df['Avg_Mom_Z'] = z_df[mom_z_cols].mean(axis=1)
-    # FIP 越低越好，因此 Z-Score 取負號 (如果 FIP 本身是正向指標則不需要，但 FIP 是波動/回撤指標，越低越好？
-    # 原策略 FIP 定義：(subset > 0).sum() / len(subset)。這是「正報酬天數佔比」。
-    # 既然是「正報酬天數佔比」，則是「越高越好」。
-    # 因此 Z_FIP 不需要取負號。
-    z_df['Z_FIP'] = zscore(metrics_df['FIP'], ddof=1, nan_policy='omit')
+    # 建立 DataFrame 並排序
+    rank_df = pd.DataFrame(metrics_list).set_index('Ticker')
+    rank_df = rank_df.sort_values(by='Total_Score', ascending=False)
     
-    z_df['Mom_Contrib (75%)'] = z_df['Avg_Mom_Z'] * 0.75
-    z_df['FIP_Contrib (25%)'] = z_df['Z_FIP'] * 0.25
-    z_df['Total_Score'] = z_df['Mom_Contrib (75%)'] + z_df['FIP_Contrib (25%)']
+    # 選出 Top 2
+    top_N = 2
+    top_tickers = rank_df.head(top_N).index.tolist()
     
-    z_df = z_df.sort_values(by='Total_Score', ascending=False)
-    top_3 = z_df.head(3).index.tolist()
-    
-    metrics_df['Total_Score'] = z_df['Total_Score']
-    metrics_df = metrics_df.loc[z_df.index]
-
-    tab_z, tab_raw = st.tabs(["📊 標準化數據 (Z-Score & 貢獻)", "🔢 原始數據 (報酬率 & FIP)"])
-
-    with tab_z:
-        st.caption("此表顯示經過標準化 (Z-Score) 後的分數，用於最終排名。")
-        z_display_cols = ['Total_Score', 'Mom_Contrib (75%)', 'FIP_Contrib (25%)', 'Avg_Mom_Z', 'Z_FIP']
-        st.dataframe(z_df[z_display_cols], use_container_width=True, column_config={"Total_Score": st.column_config.NumberColumn("總分", format="%.2f")})
-
-    with tab_raw:
-        st.caption("此表顯示未經處理的原始報酬率與 FIP 百分比。")
-        display_raw_df = metrics_df.copy()
-        pct_cols = ['FIP'] + [f'R_{p}M' for p in periods]
-        display_raw_df[pct_cols] = display_raw_df[pct_cols] * 100
-        raw_display_cols = ['Total_Score', 'FIP'] + [f'R_{p}M' for p in periods]
-        st.dataframe(display_raw_df[raw_display_cols], use_container_width=True, column_config={"Total_Score": st.column_config.NumberColumn("總分", format="%.2f")})
+    st.dataframe(rank_df.style.format("{:.4f}"), use_container_width=True)
     
     # --- 2.3 資金配置 (Allocation) ---
-    st.subheader("🏆 最終資金配置 (Top 3 等權重)")
-    cols = st.columns(len(top_3))
-    for i, ticker in enumerate(top_3):
-        with cols[i]:
-            st.success(f"**{ticker}**")
-            st.markdown("#### 33.3%")
-            try:
-                name = yf.Ticker(ticker).info.get('longName', '')
-                st.caption(name)
-            except: pass
-
+    st.subheader(f"🏆 最終資金配置 (Top {top_N} 等權重)")
+    
+    if len(top_tickers) > 0:
+        cols = st.columns(len(top_tickers))
+        weight = 100 / len(top_tickers)
+        for i, ticker in enumerate(top_tickers):
+            with cols[i]:
+                st.success(f"**{ticker}**")
+                st.markdown(f"#### {weight:.1f}%")
+                try:
+                    name = yf.Ticker(ticker).info.get('longName', '')
+                    st.caption(name)
+                except: pass
+    
     st.divider()
     st.write("🔗 快速連結:")
-    c_links = st.columns(len(top_3))
-    for i, ticker in enumerate(top_3):
-        with c_links[i]:
-            st.link_button(f"{ticker} Analysis", f"https://finance.yahoo.com/quote/{ticker}")
+    if top_tickers:
+        c_links = st.columns(len(top_tickers))
+        for i, ticker in enumerate(top_tickers):
+            with c_links[i]:
+                st.link_button(f"{ticker} Analysis", f"https://finance.yahoo.com/quote/{ticker}")
 
 # ==========================================
 # PART 2: 歷史回測分析 (Historical Backtest)
 # ==========================================
 st.markdown("---")
 st.header("⏳ 歷史回測分析 (Backtest)")
-# 修改：更新文字描述
-st.caption("回測設定：使用 DFEVX (長歷史版本)、無 EQLT。基準為 VT。")
+st.caption("回測設定：DFEVX, 無 EQLT。基準為 VT。選股邏輯：Raw Sortino(3+12) * FIP, Top 2。")
 
 if st.button("🚀 開始執行回測 (Run Backtest)"):
     check_tickers = backtest_assets + safe_pool + ['VT']
@@ -405,7 +387,7 @@ if st.button("🚀 開始執行回測 (Run Backtest)"):
     start_idx = monthly_prices.index.searchsorted(required_start)
     
     if start_idx >= len(monthly_prices):
-        st.error(f"數據不足，無法進行回測。最晚數據起始日: {latest_start.date()}")
+        st.error(f"數據不足，無法進行回測。")
         st.stop()
         
     st.info(f"回測區間: {monthly_prices.index[start_idx].date()} 至 {monthly_prices.index[-1].date()}")
@@ -416,7 +398,6 @@ if st.button("🚀 開始執行回測 (Run Backtest)"):
     total_steps = len(dates) - 1 - start_idx
     
     bt_assets_map = {t: live_assets_map.get(t, 'VTI') for t in backtest_assets}
-    # DFEVX 對應 EEM
     bt_assets_map['DFEVX'] = 'EEM' 
 
     for i in range(start_idx, len(dates) - 1):
@@ -429,6 +410,7 @@ if st.button("🚀 開始執行回測 (Run Backtest)"):
         hist_monthly = monthly_prices.loc[:curr_date]
         hist_monthly_ret = monthly_ret.loc[:curr_date]
         
+        # 1. 避險判斷 (維持不變 [3,6,9,12])
         neg_count = 0
         for t in backtest_assets:
             try:
@@ -456,7 +438,9 @@ if st.button("🚀 開始執行回測 (Run Backtest)"):
                 except: pass
             selected_tickers = [best_hedge]
         else:
+            # 2. 進攻選股 (修改：Sortino * FIP)
             survivors = []
+            # Alpha Filter (不變)
             for t in backtest_assets:
                 bench = bt_assets_map.get(t, 'VTI')
                 try:
@@ -478,32 +462,36 @@ if st.button("🚀 開始執行回測 (Run Backtest)"):
                     if a_1m > 0 or a_12m > 0: survivors.append(t)
                 except: continue
             
-            if survivors:
+            # Ranking Logic
+            if not survivors:
+                selected_tickers = ['VT']
+            else:
                 metrics = []
+                sel_lookbacks = [3, 12] # 指定回顧期
                 for t in survivors:
                     try:
-                        p_now = hist_monthly.iloc[-1][t]
-                        t_data = {'ticker': t}
-                        for p in [3, 6, 9, 12]:
-                            t_data[f'M_{p}'] = (p_now / hist_monthly.iloc[-1-p][t]) - 1
-                        t_data['FIP'] = calculate_fip(hist_daily[t])
-                        metrics.append(t_data)
+                        # Raw Sortino Average
+                        avg_s = 0
+                        for p in sel_lookbacks:
+                            avg_s += calculate_sortino(hist_daily[t], p)
+                        avg_s /= len(sel_lookbacks)
+                        
+                        # FIP
+                        fip_val = calculate_fip(hist_daily[t])
+                        
+                        # Score
+                        score = avg_s * fip_val
+                        
+                        metrics.append({'ticker': t, 'Score': score})
                     except: continue
                 
                 if metrics:
                     m_df = pd.DataFrame(metrics).set_index('ticker')
-                    z_df = pd.DataFrame(index=m_df.index)
-                    mom_z_cols = []
-                    for p in [3, 6, 9, 12]:
-                        col = f'Z_{p}'
-                        z_df[col] = zscore(m_df[f'M_{p}'], ddof=1, nan_policy='omit')
-                        mom_z_cols.append(col)
-                    z_df['Avg_Mom_Z'] = z_df[mom_z_cols].mean(axis=1)
-                    z_df['Z_FIP'] = zscore(m_df['FIP'], ddof=1, nan_policy='omit')
-                    z_df['Score'] = 0.75 * z_df['Avg_Mom_Z'] + 0.25 * z_df['Z_FIP']
-                    selected_tickers = z_df.sort_values('Score', ascending=False).head(3).index.tolist()
-            if not selected_tickers: selected_tickers = ['VT']
-                
+                    # 取 Top 2
+                    selected_tickers = m_df.sort_values('Score', ascending=False).head(2).index.tolist()
+                else:
+                    selected_tickers = ['VT']
+            
         final_ret = monthly_ret.loc[next_date, selected_tickers].mean()
         portfolio_log.append({'Date': next_date, 'Strategy': final_ret})
         
@@ -514,13 +502,11 @@ if st.button("🚀 開始執行回測 (Run Backtest)"):
     res_df['Equity'] = (1 + res_df['Strategy']).cumprod()
     res_df['DD'] = res_df['Equity'] / res_df['Equity'].cummax() - 1
     
-    # Benchmark Stats
     bench_ret = monthly_ret['VT'].loc[res_df.index]
     bench_equity = (1 + bench_ret).cumprod()
     bench_dd = bench_equity / bench_equity.cummax() - 1
     
     years = len(res_df) / 12
-    # Strategy Metrics
     cagr = (res_df['Equity'].iloc[-1]) ** (1/years) - 1
     mdd = res_df['DD'].min()
     neg_rets = res_df.loc[res_df['Strategy'] < 0, 'Strategy']
@@ -529,7 +515,6 @@ if st.button("🚀 開始執行回測 (Run Backtest)"):
     sharpe = (res_df['Strategy'].mean() * 12) / (res_df['Strategy'].std() * np.sqrt(12))
     roll5y = res_df['Equity'].rolling(60).apply(lambda x: (x.iloc[-1]/x.iloc[0])**(1/5) - 1).mean()
     
-    # Benchmark Metrics
     b_cagr = (bench_equity.iloc[-1]) ** (1/years) - 1
     b_mdd = bench_dd.min()
     b_neg = bench_ret[bench_ret < 0]
@@ -538,7 +523,6 @@ if st.button("🚀 開始執行回測 (Run Backtest)"):
     b_sharpe = (bench_ret.mean() * 12) / (bench_ret.std() * np.sqrt(12))
     b_roll5y = bench_equity.rolling(60).apply(lambda x: (x.iloc[-1]/x.iloc[0])**(1/5) - 1).mean()
     
-    # Helper Display Function
     def display_metric_pair(label, val_strat, val_bench, fmt="{:.2%}"):
         st.markdown(f"""
         <div style="margin-bottom: 10px;">
@@ -548,7 +532,6 @@ if st.button("🚀 開始執行回測 (Run Backtest)"):
         </div>
         """, unsafe_allow_html=True)
 
-    # 顯示數據
     c1, c2, c3, c4, c5 = st.columns(5)
     with c1: display_metric_pair("CAGR", cagr, b_cagr)
     with c2: display_metric_pair("MDD", mdd, b_mdd)
@@ -559,8 +542,6 @@ if st.button("🚀 開始執行回測 (Run Backtest)"):
     st.divider()
 
     # --- Altair Charts ---
-    
-    # A. 權益曲線
     df_chart = pd.DataFrame({
         'Date': res_df.index,
         'Strategy': (res_df['Equity'] - 1), 
@@ -576,7 +557,6 @@ if st.button("🚀 開始執行回測 (Run Backtest)"):
     
     st.altair_chart(chart_equity, use_container_width=True)
     
-    # B. 回撤圖
     df_dd = pd.DataFrame({
         'Date': res_df.index,
         'Strategy': res_df['DD'],
@@ -592,14 +572,10 @@ if st.button("🚀 開始執行回測 (Run Backtest)"):
     
     st.altair_chart(chart_dd, use_container_width=True)
     
-    # C. 滾動 5 年
-    roll_strat = res_df['Equity'].rolling(60).apply(lambda x: (x.iloc[-1]/x.iloc[0])**(1/5) - 1)
-    roll_bench = bench_equity.rolling(60).apply(lambda x: (x.iloc[-1]/x.iloc[0])**(1/5) - 1)
-    
     df_roll = pd.DataFrame({
         'Date': res_df.index,
-        'Strategy': roll_strat,
-        'Benchmark (VT)': roll_bench
+        'Strategy': res_df['Equity'].rolling(60).apply(lambda x: (x.iloc[-1]/x.iloc[0])**(1/5) - 1),
+        'Benchmark (VT)': bench_equity.rolling(60).apply(lambda x: (x.iloc[-1]/x.iloc[0])**(1/5) - 1)
     }).dropna().melt('Date', var_name='Asset', value_name='Rolling CAGR')
     
     chart_roll = alt.Chart(df_roll).mark_line().encode(

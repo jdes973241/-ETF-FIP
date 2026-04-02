@@ -13,7 +13,7 @@ st.set_page_config(page_title="多重資產動能策略", layout="wide")
 st.title("🛡️ 多重資產因子動能輪動策略 (Live & Backtest)")
 st.markdown("""
 **策略邏輯摘要 (Golden Array Optimized)：**
-*(註：實盤儀表板採用 EQLT，歷史回測採用 QUAL 替代以延長測試區間)*
+*(註：實盤儀表板採用 EQLT 與 DFEV，歷史回測採用 QUAL 與 DFEVX 替代以延長測試區間)*
 1.  **市場狀態 (Regime)**：計算 12 檔股票因子的平均動能 (3,6,9,12M)。若 **>= 6 檔** 動能轉負，則全面避險。
 2.  **避險模式 (Risk-Off)**：比較 **TLT** 與 **GLD** 的複合動能 (3M+12M 平均)，全倉持有強者。
 3.  **進攻模式 (Risk-On)**：
@@ -128,14 +128,14 @@ def process_data_logic(prices, live_assets_map, backtest_assets, safe_pool, curr
 # 數據準備與參數配置
 # ==========================================
 
-# 實盤儀表板維持 EQLT
+# 實盤儀表板維持 EQLT 與 DFEV
 live_assets_map = {
     'IMOM': 'EFA', 'IVAL': 'EFA', 'IDHQ': 'EFA', 'ISCF': 'EFA', 
     'QMOM': 'VTI', 'QVAL': 'VTI', 'SPHQ': 'VTI', 'FDM': 'VTI',  
-    'PIE': 'EEM',  'DFEVX': 'EEM', 'EWX': 'EEM', 'EQLT': 'EEM' 
+    'PIE': 'EEM',  'DFEV': 'EEM', 'EWX': 'EEM', 'EQLT': 'EEM' 
 }
 
-# 回測資產採用 QUAL 替代
+# 回測資產採用 QUAL 與 DFEVX 替代
 backtest_assets = [
     'IMOM', 'IVAL', 'IDHQ', 'ISCF', 
     'QMOM', 'QVAL', 'SPHQ', 'FDM',  

@@ -12,12 +12,12 @@ import pytz
 st.set_page_config(page_title="多重資產動能策略", layout="wide")
 st.title("🛡️ 多重資產因子動能輪動策略 (Live & Backtest)")
 st.markdown("""
-**策略邏輯摘要 (Sortino Optimized)：**
+**策略邏輯摘要 (Golden Array Optimized)：**
+*(註：實盤儀表板採用 EQLT，歷史回測採用 QUAL 替代以延長測試區間)*
 1.  **市場狀態 (Regime)**：計算 12 檔股票因子的平均動能 (3,6,9,12M)。若 **>= 6 檔** 動能轉負，則全面避險。
-2.  **避險模式 (Risk-Off)**：比較 **TLT** 與 **GLD** 的 12 個月報酬，全倉持有強者。
+2.  **避險模式 (Risk-Off)**：比較 **TLT** 與 **GLD** 的複合動能 (3M+12M 平均)，全倉持有強者。
 3.  **進攻模式 (Risk-On)**：
-    * **濾網**：Alpha (1M 或 12M > 0)。
-    * **評分**：**Arithmetic Sortino (3M+12M) $\\times$ FIP**。
+    * **評分**：**Arithmetic Sortino (6M+12M平均) $\\times$ FIP**。
     * **配置**：持有 **前 2 名**，等權重。
 """)
 
@@ -128,17 +128,18 @@ def process_data_logic(prices, live_assets_map, backtest_assets, safe_pool, curr
 # 數據準備與參數配置
 # ==========================================
 
+# 實盤儀表板維持 EQLT
 live_assets_map = {
     'IMOM': 'EFA', 'IVAL': 'EFA', 'IDHQ': 'EFA', 'ISCF': 'EFA', 
     'QMOM': 'VTI', 'QVAL': 'VTI', 'SPHQ': 'VTI', 'FDM': 'VTI',  
-    'PIE': 'EEM',  'DFEV': 'EEM', 'EWX': 'EEM', 'EQLT': 'EEM' 
+    'PIE': 'EEM',  'DFEVX': 'EEM', 'EWX': 'EEM', 'EQLT': 'EEM' 
 }
 
-# 回測資產排除 EQLT
+# 回測資產採用 QUAL 替代
 backtest_assets = [
     'IMOM', 'IVAL', 'IDHQ', 'ISCF', 
     'QMOM', 'QVAL', 'SPHQ', 'FDM',  
-    'PIE',  'DFEVX', 'EWX'          
+    'PIE',  'DFEVX', 'EWX', 'QUAL'          
 ]
 
 safe_pool = ['TLT', 'GLD']
@@ -181,7 +182,7 @@ with st.sidebar:
     st.divider()
 
 # ==========================================
-# 第一階段：市場狀態判斷 (還原原始表格)
+# 第一階段：市場狀態判斷 (Regime Filter)
 # ==========================================
 st.subheader("1️⃣ 第一階段：市場狀態判斷 (Regime Filter)")
 
@@ -244,7 +245,7 @@ st.divider()
 if not is_bull_market:
     # 🐻 避險模式
     st.header("2️⃣ 第二階段 (A)：避險模式 (Risk-Off)")
-    st.info("全市場動能 < 0，啟動避險。比較 TLT 與 GLD 的 12 個月報酬率。")
+    st.info("全市場動能 < 0，啟動避險。比較 TLT 與 GLD 的複合動能 (3M + 12M)。")
     
     hedge_stats = []
     best_hedge = None
@@ -253,87 +254,52 @@ if not is_bull_market:
     for asset in safe_pool:
         try:
             p_now = monthly_prices.loc[cutoff_date, asset]
+            p_3m = monthly_prices.iloc[-4][asset]
             p_12m = monthly_prices.iloc[-13][asset]
+            r_3m = (p_now / p_3m) - 1
             r_12m = (p_now / p_12m) - 1
+            avg_dual_mom = (r_3m + r_12m) / 2
             
-            hedge_stats.append({'Asset': asset, '12M Return': r_12m})
+            hedge_stats.append({'Asset': asset, '3M Return': r_3m, '12M Return': r_12m, 'Avg_3M_12M': avg_dual_mom})
             
-            if r_12m > best_hedge_ret:
-                best_hedge_ret = r_12m
+            if avg_dual_mom > best_hedge_ret:
+                best_hedge_ret = avg_dual_mom
                 best_hedge = asset
         except:
             st.warning(f"缺少 {asset} 數據")
 
     df_hedge = pd.DataFrame(hedge_stats)
     df_hedge['Selected'] = df_hedge['Asset'].apply(lambda x: '✅' if x == best_hedge else '')
-    st.dataframe(df_hedge.style.format({'12M Return': '{:.2%}'}), use_container_width=False)
+    st.dataframe(df_hedge.style.format({'3M Return': '{:.2%}', '12M Return': '{:.2%}', 'Avg_3M_12M': '{:.2%}'}), use_container_width=False)
     st.success(f"🛡️ 本月建議持倉: **{best_hedge}** (100% 權重)")
 
 else:
     # 🐂 進攻模式
     st.header("2️⃣ 第二階段 (B)：進攻模式 (Risk-On)")
     
-    # --- Alpha Filter ---
-    st.subheader("篩選：Alpha 濾網")
-    st.caption("條件：(1M Alpha > 0) OR (12M Alpha > 0)")
-    
-    survivors = []
-    filter_data = []
-    
-    for ticker in equity_tickers:
-        bench = live_assets_map[ticker]
-        try:
-            beta = calculate_daily_beta(ticker, bench, daily_ret, lookback=252)
-            r_asset_1m = monthly_ret.loc[cutoff_date, ticker]
-            r_bench_1m = monthly_ret.loc[cutoff_date, bench]
-            alpha_1m = r_asset_1m - (beta * r_bench_1m)
-            
-            p_now = monthly_prices.loc[cutoff_date, ticker]
-            p_12m = monthly_prices.iloc[-13][ticker]
-            r_asset_12m = (p_now / p_12m) - 1
-            p_b_now = monthly_prices.loc[cutoff_date, bench]
-            p_b_12m = monthly_prices.iloc[-13][bench]
-            r_bench_12m = (p_b_now / p_b_12m) - 1
-            alpha_12m = r_asset_12m - (beta * r_bench_12m)
-            
-            is_pass = (alpha_1m > 0) or (alpha_12m > 0)
-            if is_pass: survivors.append(ticker)
-            filter_data.append({
-                'Ticker': ticker, 'Pass': '✅' if is_pass else '',
-                '1M Alpha': alpha_1m, '12M Alpha': alpha_12m, 'Beta': beta
-            })
-        except Exception as e: continue
-            
-    df_filter = pd.DataFrame(filter_data)
-    st.dataframe(df_filter.style.format({
-        '1M Alpha': '{:.2%}', '12M Alpha': '{:.2%}', 'Beta': '{:.2f}'
-    }).map(lambda x: 'color: green' if x > 0 else 'color: red', subset=['1M Alpha', '12M Alpha']))
-    
-    if not survivors:
-        st.error("⚠️ 沒有標的通過 Alpha 濾網。建議轉為持有備用資產 (VT) 或現金。")
-        st.stop()
+    survivors = equity_tickers  
         
     # --- Scoring & Ranking ---
-    st.subheader("排名：Arithmetic Sortino (3M+12M) X FIP")
+    st.subheader("排名：Arithmetic Sortino (6M+12M) X FIP")
     st.caption("Sortino = Arithmetic Mean Return / Downside Deviation (LPM Method)")
     
     metrics_list = []
-    selection_lookbacks = [3, 12]
+    selection_lookbacks = [6, 12] 
 
     for ticker in survivors:
         try:
             price = monthly_prices.loc[cutoff_date, ticker]
             
-            p_3m = monthly_prices.iloc[-4][ticker]
-            raw_ret_3m = (price / p_3m) - 1
+            p_6m = monthly_prices.iloc[-7][ticker]
+            raw_ret_6m = (price / p_6m) - 1
             p_12m = monthly_prices.iloc[-13][ticker]
             raw_ret_12m = (price / p_12m) - 1
             
-            # 使用新的學術版算術平均 Sortino
-            s_3m, ann_ret_3m, downside_3m = calculate_sortino_arithmetic(daily_ret[ticker], 3)
+            # 使用學術版算術平均 Sortino
+            s_6m, ann_ret_6m, downside_6m = calculate_sortino_arithmetic(daily_ret[ticker], 6)
             s_12m, ann_ret_12m, downside_12m = calculate_sortino_arithmetic(daily_ret[ticker], 12)
             
-            avg_sortino = (s_3m + s_12m) / 2
+            avg_sortino = (s_6m + s_12m) / 2
             fip = calculate_fip(daily_ret[ticker])
             score = avg_sortino * fip
             
@@ -341,11 +307,11 @@ else:
                 'Ticker': ticker,
                 'Total_Score': score,
                 'Price': price,
-                'Raw_Ret_3M': raw_ret_3m,
+                'Raw_Ret_6M': raw_ret_6m,
                 'Raw_Ret_12M': raw_ret_12m,
-                'Sortino_3M': s_3m,
-                'Numerator_3M (Ann_Ret)': ann_ret_3m,
-                'Denominator_3M (Downside)': downside_3m,
+                'Sortino_6M': s_6m,
+                'Numerator_6M (Ann_Ret)': ann_ret_6m,
+                'Denominator_6M (Downside)': downside_6m,
                 'Sortino_12M': s_12m,
                 'Numerator_12M (Ann_Ret)': ann_ret_12m,
                 'Denominator_12M (Downside)': downside_12m,
@@ -364,11 +330,11 @@ else:
         rank_df.style.format({
             'Total_Score': '{:.4f}',
             'Price': '{:.2f}',
-            'Raw_Ret_3M': '{:.2%}',
+            'Raw_Ret_6M': '{:.2%}',
             'Raw_Ret_12M': '{:.2%}',
-            'Sortino_3M': '{:.2f}',
-            'Numerator_3M (Ann_Ret)': '{:.2%}',
-            'Denominator_3M (Downside)': '{:.2%}',
+            'Sortino_6M': '{:.2f}',
+            'Numerator_6M (Ann_Ret)': '{:.2%}',
+            'Denominator_6M (Downside)': '{:.2%}',
             'Sortino_12M': '{:.2f}',
             'Numerator_12M (Ann_Ret)': '{:.2%}',
             'Denominator_12M (Downside)': '{:.2%}',
@@ -406,7 +372,7 @@ else:
 # ==========================================
 st.markdown("---")
 st.header("⏳ 歷史回測分析 (Backtest)")
-st.caption("回測設定：使用 DFEVX (長歷史)，不含 EQLT。基準為 VT。已計入單次換倉 0.15% 摩擦成本。")
+st.caption("回測設定：12 檔股票因子，使用 DFEVX (長歷史)，替換 EQLT 為 QUAL。基準為 VT。已計入單次換倉 0.15% 摩擦成本。")
 
 if st.button("🚀 開始執行回測 (Run Backtest)"):
     check_tickers = backtest_assets + safe_pool + ['VT']
@@ -442,9 +408,8 @@ if st.button("🚀 開始執行回測 (Run Backtest)"):
         
         hist_daily = daily_ret.loc[:curr_date]
         hist_monthly = monthly_prices.loc[:curr_date]
-        hist_monthly_ret = monthly_ret.loc[:curr_date]
         
-        # 1. 避險判斷
+        # 1. 避險判斷 (3, 6, 9, 12M Avg)
         neg_count = 0
         for t in backtest_assets:
             try:
@@ -459,66 +424,43 @@ if st.button("🚀 開始執行回測 (Run Backtest)"):
         selected_tickers = []
         
         if is_bear:
+            # Risk-Off: TLT vs GLD (3M + 12M 複合動能)
             best_hedge = 'TLT'
             best_ret = -999
             for asset in ['TLT', 'GLD']:
                 try:
                     p_now = hist_monthly.iloc[-1][asset]
-                    p_prev = hist_monthly.iloc[-1-12][asset]
-                    r = (p_now / p_prev) - 1
+                    r_3m = (p_now / hist_monthly.iloc[-1-3][asset]) - 1
+                    r_12m = (p_now / hist_monthly.iloc[-1-12][asset]) - 1
+                    r = (r_3m + r_12m) / 2
                     if r > best_ret:
                         best_ret = r
                         best_hedge = asset
                 except: pass
             selected_tickers = [best_hedge]
         else:
-            # 2. 進攻選股
-            survivors = []
-            for t in backtest_assets:
-                bench = bt_assets_map.get(t, 'VTI')
+            # 2. 進攻選股 (直上 Sortino)
+            survivors = backtest_assets
+            metrics = []
+            sel_lookbacks = [6, 12] 
+            for t in survivors:
                 try:
-                    subset = hist_daily[[t, bench]].tail(252).dropna()
-                    if len(subset) > 200:
-                        cov = np.cov(subset[t], subset[bench])
-                        beta = cov[0, 1] / cov[1, 1]
-                    else: beta = 1.0
-                    r_1m = hist_monthly_ret.iloc[-1][t]
-                    b_1m = hist_monthly_ret.iloc[-1][bench]
-                    a_1m = r_1m - beta * b_1m
-                    p_now = hist_monthly.iloc[-1][t]
-                    p_12m = hist_monthly.iloc[-13][t]
-                    r_12m = (p_now / p_12m) - 1
-                    p_b_now = hist_monthly.iloc[-1][bench]
-                    p_b_12m = hist_monthly.iloc[-13][bench]
-                    b_12m = (p_b_now / p_b_12m) - 1
-                    a_12m = r_12m - beta * b_12m
-                    if a_1m > 0 or a_12m > 0: survivors.append(t)
+                    avg_s = 0
+                    for p in sel_lookbacks:
+                        s, _, _ = calculate_sortino_arithmetic(hist_daily[t], p)
+                        avg_s += s
+                    avg_s /= len(sel_lookbacks)
+                    
+                    fip_val = calculate_fip(hist_daily[t])
+                    score = avg_s * fip_val
+                    metrics.append({'ticker': t, 'Score': score})
                 except: continue
             
-            if not survivors:
-                selected_tickers = ['VT']
+            if metrics:
+                m_df = pd.DataFrame(metrics).set_index('ticker')
+                selected_tickers = m_df.sort_values('Score', ascending=False).head(2).index.tolist()
             else:
-                metrics = []
-                sel_lookbacks = [3, 12]
-                for t in survivors:
-                    try:
-                        avg_s = 0
-                        for p in sel_lookbacks:
-                            # 替換為 Arithmetic Sortino
-                            s, _, _ = calculate_sortino_arithmetic(hist_daily[t], p)
-                            avg_s += s
-                        avg_s /= len(sel_lookbacks)
-                        
-                        fip_val = calculate_fip(hist_daily[t])
-                        score = avg_s * fip_val
-                        metrics.append({'ticker': t, 'Score': score})
-                    except: continue
-                
-                if metrics:
-                    m_df = pd.DataFrame(metrics).set_index('ticker')
-                    selected_tickers = m_df.sort_values('Score', ascending=False).head(2).index.tolist()
-                else:
-                    selected_tickers = ['VT']
+                selected_tickers = ['VT']
         
         raw_final_ret = monthly_ret.loc[next_date, selected_tickers].mean()
         
@@ -579,7 +521,7 @@ if st.button("🚀 開始執行回測 (Run Backtest)"):
     
     st.divider()
 
-    # --- Altair Charts (還原原始繪圖) ---
+    # --- Altair Charts ---
     df_chart = pd.DataFrame({
         'Date': res_df.index,
         'Strategy': (res_df['Equity'] - 1), 

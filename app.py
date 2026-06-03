@@ -12,14 +12,23 @@ import pytz
 st.set_page_config(page_title="多重資產動能策略", layout="wide")
 st.title("🛡️ 多重資產因子動能輪動策略 (Live & Backtest)")
 st.markdown("""
-**策略邏輯摘要 (Robustness Optimized v5)：**
+**策略邏輯摘要 (Robustness Optimized v6 — Regime 已驗證定稿)：**
 *(註：實盤儀表板採用 EQLT 與 DFEV，歷史回測採用 QUAL 與 DFEVX 替代以延長測試區間)*
 1.  **市場狀態 (Regime)**：計算 12 檔股票因子的 **13612W 加權動能** (12×1M + 4×3M + 2×6M + 1×12M)。若轉負標的 **>= 75%** (⌈檔數×0.75⌉，12 檔時為 9 檔)，則全面避險。
+    *（13612W 已經研究池 25 種動能定義 × 4 閾值檢定：實際閾值鄰域 Sharpe 排名第 1、鄰域平均第 2/25、無候選定義可顯著勝出，故沿用。）*
 2.  **避險模式 (Risk-Off)**：**TLT 與 GLD 等權 50/50** 持有（已移除原動能擇時參數）。
 3.  **進攻模式 (Risk-On)**：
     * **評分**：**非重疊純報酬動能 NRet_0_6_6_12** — ([0–6]月年化報酬 + [6–12]月年化報酬) / 2，兩段非重疊，**無 FIP**。
     * **配置**：持有 **前 2 名**，等權重。
 """)
+
+# 重抓數據按鈕（置於資料下載前，確保任何標的缺失導致判讀異常時仍可一鍵重抓）
+col_refresh, _ = st.columns([1, 4])
+with col_refresh:
+    if st.button("🔄 重新抓取數據（清除快取）", use_container_width=True):
+        st.cache_data.clear()
+        st.rerun()
+st.caption("若發現部分標的數據缺失或判讀異常，請點此清除快取並重新下載。")
 
 # ==========================================
 # 核心邏輯函數
@@ -177,6 +186,7 @@ st.subheader("1️⃣ 第一階段：市場狀態判斷 (Regime Filter)")
 regime_stats = []
 neg_count = 0 
 valid_count = 0
+missing_tickers = []   # 資料缺失防呆：記錄 NaN / 無資料標的
 
 for ticker in equity_tickers:
     try:
@@ -187,26 +197,50 @@ for ticker in equity_tickers:
         r_6 = (p_now / monthly_prices.iloc[-7][ticker]) - 1
         r_12 = (p_now / monthly_prices.iloc[-13][ticker]) - 1
         ticker_w_mom = 12 * r_1 + 4 * r_3 + 2 * r_6 + r_12
-        
+
+        # 防呆：資料缺失 (NaN) 標的標記 ⚪ 並排除於統計外，
+        # 避免 NaN 被誤判為轉負紅燈（造成視覺與 neg_count 不一致的判讀異常）
+        if np.isnan(ticker_w_mom):
+            regime_stats.append({
+                'Ticker': ticker, 'Status': '⚪',
+                'W_Mom (13612W)': np.nan,
+                '1M': r_1, '3M': r_3, '6M': r_6, '12M': r_12
+            })
+            missing_tickers.append(ticker)
+            continue
+
         status_icon = "🟢" if ticker_w_mom > 0 else "🔴"
         if ticker_w_mom < 0:
             neg_count += 1
-            
+        valid_count += 1
+
         regime_stats.append({
             'Ticker': ticker,
             'Status': status_icon,
             'W_Mom (13612W)': ticker_w_mom,
             '1M': r_1, '3M': r_3, '6M': r_6, '12M': r_12
         })
-        
-        if not np.isnan(ticker_w_mom):
-            valid_count += 1
-    except Exception as e:
+    except Exception:
+        # 完全無資料：標記 ⚪，排除於統計外
+        regime_stats.append({
+            'Ticker': ticker, 'Status': '⚪',
+            'W_Mom (13612W)': np.nan,
+            '1M': np.nan, '3M': np.nan, '6M': np.nan, '12M': np.nan
+        })
+        missing_tickers.append(ticker)
         continue
+
+# 資料缺失警告（防呆）
+if missing_tickers:
+    st.warning(
+        f"⚠️ 偵測到 {len(missing_tickers)} 檔資料缺失：{', '.join(missing_tickers)}。"
+        f"已標記 ⚪ 並排除於 Regime 統計外，避免誤判為轉負。"
+        f"建議點上方「🔄 重新抓取數據」補回後再判讀。"
+    )
 
 # Thr_75% 動態閾值：⌈有效檔數 × 0.75⌉
 THRESHOLD_RATIO = 0.75
-THRESHOLD_N = int(np.ceil(valid_count * THRESHOLD_RATIO))
+THRESHOLD_N = int(np.ceil(valid_count * THRESHOLD_RATIO)) if valid_count > 0 else 1
 is_bull_market = neg_count < THRESHOLD_N
 
 col1, col2 = st.columns([1, 2])
@@ -218,8 +252,13 @@ col2.caption(f"避險觸發條件：轉弱標的數量 >= {THRESHOLD_N} (⌈{val
 
 with st.expander("查看全市場 12 檔 ETF 動能細節 (13612W 加權)"):
     df_regime = pd.DataFrame(regime_stats)
+    df_regime.index = range(1, len(df_regime) + 1)   # 編號從 1 開始
     cols = ['Ticker', 'Status', 'W_Mom (13612W)', '1M', '3M', '6M', '12M']
-    st.dataframe(df_regime[cols].style.format("{:.2%}", subset=['W_Mom (13612W)', '1M', '3M', '6M', '12M']))
+    st.dataframe(
+        df_regime[cols].style.format(
+            "{:.2%}", subset=['W_Mom (13612W)', '1M', '3M', '6M', '12M'], na_rep="—"
+        )
+    )
 
 st.divider()
 
@@ -334,7 +373,7 @@ else:
 # ==========================================
 st.markdown("---")
 st.header("⏳ 歷史回測分析 (Backtest)")
-st.caption("回測設定 (v5)：12 檔股票因子，使用 DFEVX (長歷史)，替換 EQLT 為 QUAL。基準為 VT。Regime=13612W+Thr75%；避險=TLT/GLD 等權；進攻=NRet_0_6_6_12。已計入單次換倉 0.15% 摩擦成本。")
+st.caption("回測設定 (v6)：12 檔股票因子，使用 DFEVX (長歷史)，替換 EQLT 為 QUAL。基準為 VT。Regime=13612W+Thr75%；避險=TLT/GLD 等權；進攻=NRet_0_6_6_12。已計入單次換倉 0.15% 摩擦成本。")
 
 if st.button("🚀 開始執行回測 (Run Backtest)"):
     check_tickers = backtest_assets + safe_pool + ['VT']

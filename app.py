@@ -19,7 +19,7 @@ st.markdown("""
 2.  **避險模式 (Risk-Off)**：**TLT 與 GLD 等權 50/50** 持有（已移除原動能擇時參數）。
 3.  **進攻模式 (Risk-On)**：
     * **評分**：**非重疊純報酬動能 NRet_0_6_6_12** — ([0–6]月年化報酬 + [6–12]月年化報酬) / 2，兩段非重疊，**無 FIP**。
-    * **配置**：持有 **前 2 名**，等權重。
+    * **配置**：持有 **前 3 名**，等權重。
 """)
 
 # 重抓數據按鈕（置於資料下載前，確保任何標的缺失導致判讀異常時仍可一鍵重抓）
@@ -33,12 +33,6 @@ st.caption("若發現部分標的數據缺失或判讀異常，請點此清除�
 # ==========================================
 # 核心邏輯函數
 # ==========================================
-def calculate_daily_beta(asset, bench, daily_df, lookback=252):
-    subset = daily_df[[asset, bench]].dropna().tail(lookback)
-    if len(subset) < lookback * 0.8: return 1.0
-    cov = np.cov(subset[asset], subset[bench])
-    return cov[0, 1] / cov[1, 1]
-
 def calculate_return_nonoverlap(daily_series, start_month, end_month):
     """
     [v5 進攻核心] 非重疊區間年化報酬 (NRet)
@@ -141,6 +135,9 @@ backtest_assets = [
 
 safe_pool = ['TLT', 'GLD']
 others = ['VT'] 
+
+# 進攻持有檔數（即時面板與回測共用同一來源，確保一致）
+TOP_N = 3
 
 all_symbols = list(set(list(live_assets_map.keys()) + list(live_assets_map.values()) + backtest_assets + safe_pool + others))
 
@@ -330,7 +327,7 @@ else:
     rank_df = pd.DataFrame(metrics_list).set_index('Ticker')
     rank_df = rank_df.sort_values(by='Total_Score', ascending=False)
     
-    top_N = 2
+    top_N = TOP_N
     top_tickers = rank_df.head(top_N).index.tolist()
     
     st.dataframe(
@@ -421,11 +418,14 @@ if st.button("🚀 開始執行回測 (Run Backtest)"):
                 r_6 = (p_now / hist_monthly.iloc[-7][t]) - 1
                 r_12 = (p_now / hist_monthly.iloc[-13][t]) - 1
                 w_mom = 12 * r_1 + 4 * r_3 + 2 * r_6 + r_12
+                # 防呆：資料缺失 (NaN) 跳過不計入統計（與即時面板一致，避免污染分母）
+                if np.isnan(w_mom):
+                    continue
                 valid_count_bt += 1
                 if w_mom < 0: neg_count += 1
             except: continue
             
-        threshold_n_bt = int(np.ceil(valid_count_bt * 0.75))
+        threshold_n_bt = int(np.ceil(valid_count_bt * 0.75)) if valid_count_bt > 0 else 1
         is_bear = neg_count >= threshold_n_bt
         selected_tickers = []
         
@@ -448,7 +448,7 @@ if st.button("🚀 開始執行回測 (Run Backtest)"):
             
             if metrics:
                 m_df = pd.DataFrame(metrics).set_index('ticker')
-                selected_tickers = m_df.sort_values('Score', ascending=False).head(2).index.tolist()
+                selected_tickers = m_df.sort_values('Score', ascending=False).head(TOP_N).index.tolist()
             else:
                 selected_tickers = ['VT']
         
